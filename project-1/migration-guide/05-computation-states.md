@@ -1,0 +1,530 @@
+# Step 5: Computation State Machine
+
+## 🎯 Goal
+Implement lazy evaluation with a state machine to prevent unnecessary recomputations and ensure glitch-free updates.
+
+## 🤔 The Problem: Eager Recomputation
+
+### Your Current Implementation
+
+```javascript
+// Every signal change triggers immediate recomputation
+function write(newValue) {
+  value = newValue;
+  
+  for (const subscriber of subscribers) {
+    subscriber.execute(); // ← Always runs, even if not accessed
+  }
+}
+```
+
+**Problems:**
+1. **Wasteful**: Recomputes even if value never read
+2. **Glitches**: Temporary inconsistent states
+3. **No priorities**: All effects treated equally
+
+### Example: The Glitch Problem
+
+```javascript
+const [firstName, setFirstName] = createSignal("John");
+const [lastName, setLastName] = createSignal("Doe");
+
+const fullName = createMemo(() => {
+  return `${firstName()} ${lastName()}`;
+});
+
+createEffect(() => {
+  console.log(fullName());
+});
+
+// Update both
+batch(() => {
+  setFirstName("Jane");  // fullName = "Jane Doe" (inconsistent!)
+  setLastName("Smith");  // fullName = "Jane Smith" (correct)
+});
+
+// With eager execution:
+// Logs: "Jane Doe" (wrong!) then "Jane Smith"
+
+// With lazy + states:
+// Logs: "Jane Smith" (only the final, correct value)
+```
+
+## 📊 The State Machine
+
+### Three States
+
+```
+┌──────────┐
+│  CLEAN   │  State = 0
+│  (0)     │  Computation is up-to-date
+└──────────┘  Can be read without recomputation
+      ↑
+      │ recompute
+      │
+      ↓
+┌──────────┐  write signal ┌──────────┐
+│  STALE   │◄──────────────│ PENDING  │
+│  (1)     │               │  (2)     │
+└──────────┘               └──────────┘
+Needs full                 Waiting for
+recomputation             upstream to
+                          update first
+```
+
+### State Transitions
+
+```typescript
+// Initial state
+computation.state = 0; // CLEAN
+
+// Signal dependency changes
+writeSignal(signal, newValue);
+  → computation.state = STALE;  // Mark for recomputation
+
+// When computation is accessed
+if (computation.state === STALE) {
+  // Check upstream dependencies first
+  for (source of computation.sources) {
+    if (source.state === STALE) {
+      computation.state = PENDING; // Wait for upstream
+      updateComputation(source);   // Update upstream first
+    }
+  }
+  
+  // Now update this computation
+  updateComputation(computation);
+  computation.state = 0; // CLEAN
+}
+```
+
+## 🏗️ Implementation
+
+### Step 1: Constants
+
+```typescript
+// reactive.ts
+
+/**
+ * Computation states
+ */
+export const STALE = 1;    // Needs recomputation
+export const PENDING = 2;  // Waiting for upstream
+
+/**
+ * Global execution counter for topological ordering
+ * Incremented on each update cycle
+ */
+let ExecCount = 0;
+```
+
+### Step 2: Update Computation Structure
+
+```typescript
+export interface Computation<Init, Next extends Init = Init> extends Owner {
+  fn: EffectFunction<Init, Next>;
+  
+  state: ComputationState;  // ← Add this
+  updatedAt: number | null; // ← Add this (for glitch prevention)
+  
+  sources: SignalState<any>[] | null;
+  sourceSlots: number[] | null;
+  value?: Init;
+  pure: boolean;
+  // ... other fields
+}
+```
+
+### Step 3: Mark Computations as STALE
+
+```typescript
+export function writeSignal(node: SignalState<any>, value: any): any {
+  // Check if value changed
+  if (!node.comparator || !node.comparator(node.value, value)) {
+    node.value = value;
+    
+    // Notify observers
+    if (node.observers && node.observers.length) {
+      runUpdates(() => {
+        for (let i = 0; i < node.observers!.length; i += 1) {
+          const o = node.observers![i];
+          
+          // Only mark if not already stale
+          if (!o.state) {
+            // Add to appropriate queue
+            if (o.pure) Updates!.push(o);  // Memos first
+            else Effects!.push(o);          // Effects second
+            
+            // Propagate to downstream
+            if ((o as Memo<any>).observers) {
+              markDownstream(o as Memo<any>);
+            }
+          }
+          
+          o.state = STALE; // ← Mark as needing update
+        }
+      }, false);
+    }
+  }
+  
+  return value;
+}
+```
+
+### Step 4: Check State Before Reading
+
+```typescript
+export function readSignal(this: SignalState<any> | Memo<any>): any {
+  // If this is a memo, check if it needs updating
+  if ((this as Memo<any>).sources && (this as Memo<any>).state) {
+    const memo = this as Memo<any>;
+    
+    if (memo.state === STALE) {
+      // Fully recompute
+      updateComputation(memo);
+    } else if (memo.state === PENDING) {
+      // Check upstream first
+      const updates = Updates;
+      Updates = null;
+      runUpdates(() => lookUpstream(memo), false);
+      Updates = updates;
+    }
+  }
+  
+  // Track dependency
+  if (Listener) {
+    const sSlot = this.observers ? this.observers.length : 0;
+    
+    if (!Listener.sources) {
+      Listener.sources = [this];
+      Listener.sourceSlots = [sSlot];
+    } else {
+      Listener.sources.push(this);
+      Listener.sourceSlots!.push(sSlot);
+    }
+    
+    if (!this.observers) {
+      this.observers = [Listener];
+      this.observerSlots = [Listener.sources.length - 1];
+    } else {
+      this.observers.push(Listener);
+      this.observerSlots!.push(Listener.sources.length - 1);
+    }
+  }
+  
+  return this.value;
+}
+```
+
+### Step 5: Look Upstream for PENDING
+
+```typescript
+/**
+ * Recursively updates upstream dependencies
+ * Used when a computation is PENDING
+ */
+function lookUpstream(node: Computation<any>, ignore?: Computation<any>): void {
+  // Clear pending state
+  node.state = 0;
+  
+  // Check each source
+  for (let i = 0; i < node.sources!.length; i += 1) {
+    const source = node.sources![i] as Memo<any>;
+    
+    // Only check memos (signals are always current)
+    if (source.sources) {
+      const state = source.state;
+      
+      if (state === STALE) {
+        // Source needs updating and we haven't updated it yet
+        if (source !== ignore && 
+            (!source.updatedAt || source.updatedAt < ExecCount)) {
+          runTop(source);
+        }
+      } else if (state === PENDING) {
+        // Source is pending, recurse
+        lookUpstream(source, ignore);
+      }
+    }
+  }
+}
+```
+
+### Step 6: Run with Topological Ordering
+
+```typescript
+/**
+ * Updates a computation, checking upstream first
+ * Ensures topological order (dependencies before dependents)
+ */
+function runTop(node: Computation<any>): void {
+  // Already clean?
+  if (node.state === 0) return;
+  
+  // Still pending? Look upstream
+  if (node.state === PENDING) return lookUpstream(node);
+  
+  // Collect ancestors that need updating
+  const ancestors = [node];
+  
+  while ((node = node.owner as Computation<any>) && 
+         (!node.updatedAt || node.updatedAt < ExecCount)) {
+    if (node.state) ancestors.push(node);
+  }
+  
+  // Update from top down (parents before children)
+  for (let i = ancestors.length - 1; i >= 0; i--) {
+    node = ancestors[i];
+    
+    if (node.state === STALE) {
+      updateComputation(node);
+    } else if (node.state === PENDING) {
+      const updates = Updates;
+      Updates = null;
+      runUpdates(() => lookUpstream(node, ancestors[0]), false);
+      Updates = updates;
+    }
+  }
+}
+```
+
+### Step 7: Update Computation with State Management
+
+```typescript
+function updateComputation(node: Computation<any>): void {
+  if (!node.fn) return;
+  
+  // Clean up old dependencies
+  cleanNode(node);
+  
+  const time = ExecCount;
+  
+  // Run the computation
+  runComputation(node, node.value, time);
+}
+
+function runComputation(
+  node: Computation<any>,
+  value: any,
+  time: number
+): void {
+  let nextValue;
+  
+  const owner = Owner;
+  const listener = Listener;
+  
+  Listener = Owner = node;
+  
+  try {
+    nextValue = node.fn(value);
+  } catch (err) {
+    handleError(err);
+    return;
+  } finally {
+    Listener = listener;
+    Owner = owner;
+  }
+  
+  // Update if not already updated this cycle
+  if (!node.updatedAt || node.updatedAt <= time) {
+    // If this is a memo, notify observers
+    if (node.updatedAt != null && "observers" in node) {
+      writeSignal(node as Memo<any>, nextValue, true);
+    } else {
+      node.value = nextValue;
+    }
+    
+    node.updatedAt = time;  // Mark as updated
+    node.state = 0;         // Mark as clean
+  }
+}
+```
+
+## 🎨 Example: State Machine in Action
+
+### Code
+
+```typescript
+const [a, setA] = createSignal(1);
+const [b, setB] = createSignal(2);
+
+const sum = createMemo(() => {
+  console.log("Computing sum");
+  return a() + b();
+});
+
+const doubled = createMemo(() => {
+  console.log("Computing doubled");
+  return sum() * 2;
+});
+
+createEffect(() => {
+  console.log("Result:", doubled());
+});
+```
+
+### Execution Flow
+
+```
+Initial:
+  sum.state = 0 (CLEAN)
+  doubled.state = 0 (CLEAN)
+  effect.state = 0 (CLEAN)
+
+setA(5):
+  1. writeSignal(a, 5)
+  2. sum.state = STALE
+  3. Add sum to Updates queue
+  
+  4. markDownstream(sum)
+  5. doubled.state = PENDING
+  6. Add doubled to Updates queue
+  
+  7. markDownstream(doubled)
+  8. effect.state = PENDING
+  9. Add effect to Effects queue
+
+Flush Updates:
+  10. runTop(sum)
+      - sum.state === STALE
+      - updateComputation(sum)
+      - Logs: "Computing sum"
+      - sum.value = 7
+      - sum.state = 0 (CLEAN)
+      - sum.updatedAt = ExecCount
+  
+  11. runTop(doubled)
+      - doubled.state === PENDING
+      - lookUpstream(doubled)
+        - Check sum: state = 0, updatedAt = ExecCount ✓
+      - updateComputation(doubled)
+      - Logs: "Computing doubled"
+      - doubled.value = 14
+      - doubled.state = 0 (CLEAN)
+
+Flush Effects:
+  12. runTop(effect)
+      - effect.state === PENDING
+      - lookUpstream(effect)
+        - Check doubled: state = 0 ✓
+      - updateComputation(effect)
+      - Logs: "Result: 14"
+      - effect.state = 0 (CLEAN)
+
+Final state:
+  All computations CLEAN
+  All values consistent
+  No glitches! 🎉
+```
+
+## 🔍 Why This Matters
+
+### 1. Lazy Evaluation
+
+```typescript
+const expensive = createMemo(() => {
+  console.log("Expensive computation");
+  return heavyCalculation();
+});
+
+// Signal changes, but memo not read
+setSignal(newValue);
+// memo.state = STALE, but NOT computed yet
+
+// Only computed when accessed
+console.log(expensive()); // ← Now it computes
+```
+
+### 2. Glitch Prevention
+
+```typescript
+const [x, setX] = createSignal(1);
+const [y, setY] = createSignal(2);
+
+const sum = createMemo(() => x() + y());
+const product = createMemo(() => sum() * 2);
+
+batch(() => {
+  setX(5);  // sum.state = STALE
+  setY(10); // sum already STALE
+});
+
+// sum only computes once with final values: (5 + 10) * 2 = 30
+// Without states: would compute (5 + 2) * 2 = 14, then (5 + 10) * 2 = 30
+```
+
+### 3. Topological Ordering
+
+```typescript
+//     A
+//    / \
+//   B   C
+//    \ /
+//     D
+
+setA(newValue);
+
+// Update order: A → B → C → D
+// Guaranteed: parents before children
+// D always sees consistent B and C values
+```
+
+## ✅ Implementation Checklist
+
+- [ ] Add `state` and `updatedAt` to Computation
+- [ ] Add `ExecCount` global counter
+- [ ] Update `writeSignal` to mark STALE
+- [ ] Implement `readSignal` state checking
+- [ ] Implement `lookUpstream` for PENDING
+- [ ] Implement `runTop` with topological ordering
+- [ ] Update `runComputation` to set state and timestamp
+- [ ] Test with complex dependency graphs
+
+## 🧪 Testing
+
+```typescript
+test("lazy evaluation", () => {
+  const [s, setS] = createSignal(0);
+  let computes = 0;
+  
+  const memo = createMemo(() => {
+    computes++;
+    return s() * 2;
+  });
+  
+  setS(1); // memo.state = STALE
+  expect(computes).toBe(0); // Not computed yet
+  
+  memo(); // Force read
+  expect(computes).toBe(1); // Now computed
+});
+
+test("no glitches", () => {
+  const [a, setA] = createSignal(1);
+  const [b, setB] = createSignal(2);
+  
+  const sum = createMemo(() => a() + b());
+  
+  const results: number[] = [];
+  createEffect(() => {
+    results.push(sum());
+  });
+  
+  results.length = 0; // Reset
+  
+  batch(() => {
+    setA(5);
+    setB(10);
+  });
+  
+  expect(results).toEqual([15]); // Only final value, no intermediate
+});
+```
+
+## 🚀 Next Step
+
+Continue to **[06-effect-scheduling.md](./06-effect-scheduling.md)** to implement proper effect queuing and execution order.
+
+---
+
+**💡 Pro Tip**: States are what make Solid.js "pull-based" while still being reactive. Lazy + precise = fast!
