@@ -1,5 +1,6 @@
 /** biome-ignore-all lint/suspicious/noAssignInExpressions: <explanation> */
-import { IS_DEV, STALE, UNOWNED_OWNER } from "./constants.ts";
+import type { Memo, MemoOptions, SignalState } from "./reactive-types.ts";
+import { FRESH, IS_DEV, PENDING, STALE, UNOWNED_OWNER } from "./constants.ts";
 import type {
   Owner,
   Computation,
@@ -32,7 +33,7 @@ export let CURRENT_OWNER: Owner | null = null;
  * Currently executing computation (for dependency tracking)
  * When you read a signal, it subscribes this Listener
  */
-export let CURRENT_LISTENER: Computation<any> | null = null;
+export let CURRENT_LISTENER: Computation<any, any> | null = null;
 /**
  * Multiple queues for different priorities
  *
@@ -65,13 +66,20 @@ export let CURRENT_LISTENER: Computation<any> | null = null;
  * **Performance:** Batch similar work together
  */
 /** Pure computations (memos) */
-export const Updates: Computation<any>[] | null = null;
+export let Updates: Computation<any>[] | null = null;
 /** Side effects */
-export const Effects: Computation<any>[] | null = null;
+export let Effects: Computation<any>[] | null = null;
 // const Transition: TransitionState;
 // const Scheduler: Function;
 
-const ExecCount = 0;
+let ExecCount = 0;
+const defaultComparator = Object.is;
+
+/**
+ * ================================================
+ *               Ownership Model
+ * ================================================
+ */
 
 function untrack<T>(fn: () => T) {
   const prevListener = CURRENT_LISTENER;
@@ -161,6 +169,12 @@ export function createRoot<T>(
     // Restore previous context
     CURRENT_OWNER = prevOwner;
     CURRENT_LISTENER = prevListener;
+  }
+}
+
+function handleError(error: any): void {
+  if (IS_DEV) {
+    console.error("Reactive error:", error);
   }
 }
 
@@ -351,7 +365,7 @@ export function runComputation(
  * Bottom-up: children before parents
  */
 function cleanNode(node: Owner): void {
-  // 1. Dispose all owned children (recursive!)
+  /** 1. Dispose all owned children (recursive!) */
   if (node.owned) {
     for (let i = 0; i < node.owned.length; i++) {
       cleanNode(node.owned[i]!);
@@ -359,36 +373,80 @@ function cleanNode(node: Owner): void {
     node.owned = null;
   }
 
-  // 2. Remove from dependency graph (if computation)
-  if ((node as Computation<any>).sources) {
+  /** 2. Remove from dependency graph (if computation) */
+  if ((node as Computation<any>).sources?.length) {
     const comp = node as Computation<any>;
 
-    // Remove this computation from all the signals it is subscribed to
+    /** Remove this computation from all the signals it is subscribed to */
     while (comp.sources!.length) {
-      const lastSrc = comp.sources!.pop()!;
-      const lastSrcIdx = comp.sourceSlots!.pop()!;
+      const lastSrc =
+        comp.sources!.pop()!; /** Remove and get last source O(1) */
+      const lastSrcIdx =
+        comp.sourceSlots!.pop()!; /** Remove and get last source slot O(1) */
       const observers = lastSrc.observers;
 
-      // Swap with last element for O(1) removal
+      /** Swap with last element for O(1) removal */
       if (observers?.length) {
-        // first let's pop the last
-        const lastObs = observers.pop()!;
-        const lastObsIdx = lastSrc.observerSlots!.pop()!;
+        /** first let's pop the last */
+        const lastObs =
+          observers.pop()!; /** Remove and get last observer O(1) */
+        const lastObsIdx =
+          lastSrc.observerSlots!.pop()!; /** Remove and get last observer slot O(1) */
 
-        // The following condition only when it's less than length
-        // Which means the popped one is not the target
+        /** If we didn't remove the last element, swap it into the gap */
         if (lastSrcIdx < observers.length) {
-          // Then the target wasn't the last element
-          // Rearrange the popped one sources with the target
+          /** Update the swapped element's slot */
+          /** Q: Is the `lastObs.source![lastObsIdx]` should be the same computation as `comp`?
+           * A: Yes, it should be the same computation as `comp`.
+           * This is because `lastObs` is the last observer that was removed from the `observers` array of `lastSrc`,
+           * and `lastObsIdx` is the index in `lastObs.sourceSlots` that corresponds to `lastSrc`.
+           * Since we are swapping elements to maintain O(1) removal,
+           * we need to update the slot in `lastObs` to point to
+           * the new index of `lastSrc` in its `sources` array.
+           */
           lastObs.sourceSlots![lastObsIdx] = lastSrcIdx;
-          // Return the popped one to the observer list by replacing it with the target
+          /** Place it in the gap */
           observers[lastSrcIdx] = lastObs;
           lastSrc.observerSlots![lastSrcIdx] = lastObsIdx;
         }
       }
+
+      /**
+       * @note
+       *
+       * How Swap-and-Pop Works:
+       *
+       * ```
+       * Remove effect2 from signal.observers:
+       *
+       * Before:
+       * observers:     [effect1, effect2, effect3, effect4]
+       * observerSlots: [   0   ,    1   ,    0   ,    1   ]
+       *                            ↑ Remove this
+       *
+       * Step 1: Get last element
+       * last = observers.pop()        // effect4
+       * lastSlot = observerSlots.pop() // 1
+       *
+       * observers:     [effect1, effect2, effect3]
+       * observerSlots: [   0   ,    1   ,    0   ]
+       *
+       * Step 2: Swap last into the gap (index=1)
+       * observers[1] = effect4
+       * observerSlots[1] = 1
+       *
+       * observers:     [effect1, effect4, effect3]
+       * observerSlots: [   0   ,    1   ,    0   ]
+       *
+       * Step 3: Update effect4's sourceSlot
+       * effect4.sourceSlots[1] = 1  // Points to new position
+       *
+       * Done! Removed in O(1) time.
+       * ```
+       */
     }
   }
-  // 3. Run cleanup functions
+  /** 3. Run cleanup functions */
   if (node.cleanups) {
     for (let i = 0; i < node.cleanups.length; i++) {
       node.cleanups[i]!();
@@ -396,7 +454,7 @@ function cleanNode(node: Owner): void {
     node.cleanups = null;
   }
 
-  // 4. Reset state
+  /** 4. Reset state */
   (node as Computation<any>).state = STALE;
 }
 
@@ -434,4 +492,218 @@ function updateComputation(node: Computation<any>): void {
 
   const time = ExecCount;
   runComputation(node, node.value, time);
+}
+
+/**
+ * ================================================
+ *               Bidirectional Tracking
+ * ================================================
+ */
+
+export function readSignal<T>(this: SignalState<T>): T {
+  if (CURRENT_LISTENER) {
+    /**
+     * Push the signal to the listener _(who will subscribe to the signal)_
+     * `sources` and store it's position/index/slot
+     */
+    const srcIdx = (CURRENT_LISTENER.sources ??= []).push(this);
+    /**
+     * Push the listener to the signal
+     * `observers` and store it's position/index/slot
+     */
+    const obsIdx = (this.observers ??= []).push(CURRENT_LISTENER);
+
+    /**
+     * Now, on the listener `sourceSlots`, we will push
+     * where it's on the signal `observers`
+     */
+    (CURRENT_LISTENER.sourceSlots ??= []).push(obsIdx);
+
+    /**
+     * Then, on the signal `observerSlots`, we will push
+     * where it's on the listener `sources`
+     */
+    (this.observerSlots ??= []).push(srcIdx);
+
+    /**
+     * Step-by-step visualization:
+     *
+     * ```
+     * // Initial state
+     * signal.observers = null;
+     * signal.observerSlots = null;
+     * effect.sources = null;
+     * effect.sourceSlots = null;
+     *
+     * // First read
+     * Listener = effect;
+     * signal(); // Calls readSignal
+     *
+     * // After first read
+     * signal.observers = [effect];
+     * signal.observerSlots = [0]; // effect.sources[0] points back to signal
+     * effect.sources = [signal];
+     * effect.sourceSlots = [0]; // signal.observers[0] points back to effect
+     *
+     * // Second read (different signal)
+     * signal2();
+     *
+     * // After second read
+     * signal.observers = [effect];
+     * signal.observerSlots = [0];
+     * signal2.observers = [effect];
+     * signal2.observerSlots = [1]; // effect.sources[1] points back to signal2
+     * effect.sources = [signal, signal2];
+     * effect.sourceSlots = [0, 1];
+     * ```
+     */
+  }
+
+  return this.value;
+}
+
+export function writeSignal<T>(node: SignalState<T>, value: T) {
+  // Check if value actually changed
+  if (!(node.comparator ?? defaultComparator)(node.value, value)) {
+    node.value = value;
+    /**
+     * **Code:**
+     *
+     * ```js
+     * const [a, setA] = createSignal(1);
+     * const [b, setB] = createSignal(2);
+     *
+     * const sum = createMemo(() => a() + b());
+     *
+     * const doubled = createMemo(() => sum() * 2);
+     *
+     * createEffect(() => {
+     *   console.log(doubled());
+     * });
+     * ```
+     *
+     * **Dependency Graph:**
+     *
+     * ```
+     * Signal A ────────┐
+     *                   ↓
+     * Signal B ──────→ Memo(sum) ──→ Memo(doubled) ──→ Effect
+     *                   ↑
+     *          Bidirectional links
+     *
+     * Each arrow is actually TWO links:
+     *   Forward:  source → observer
+     *   Backward: observer → source (via slots)
+     * ```
+     *
+     * **Data Structure:**
+     *
+     * ```js
+     * // Signal A
+     * {
+     *   observers: [sum],
+     *   observerSlots: [0]  // sum.sources[0] = A
+     * }
+     *
+     * // Signal B
+     * {
+     *   observers: [sum],
+     *   observerSlots: [1]  // sum.sources[1] = B
+     * }
+     *
+     * // Memo: sum
+     * {
+     *   sources: [A, B],
+     *   sourceSlots: [0, 0],    // A.observers[0], B.observers[0]
+     *   observers: [doubled],
+     *   observerSlots: [0]      // doubled.sources[0] = sum
+     * }
+     *
+     * // Memo: doubled
+     * {
+     *   sources: [sum],
+     *   sourceSlots: [0],       // sum.observers[0]
+     *   observers: [effect],
+     *   observerSlots: [0]      // effect.sources[0] = doubled
+     * }
+     *
+     * // Effect
+     * {
+     *   sources: [doubled],
+     *   sourceSlots: [0]        // doubled.observers[0]
+     * }
+     * ```
+     *
+     * **Removal Example:**
+     *
+     * ```js
+     * // What happens when sum memo re-runs?
+     *
+     * cleanNode(sum);
+     *
+     * // Step 1: Remove sum from A.observers
+     * //   swap-and-pop: O(1)
+     *
+     * // Step 2: Remove sum from B.observers
+     * //   swap-and-pop: O(1)
+     *
+     * // Step 3: sum.sources = []
+     * // Step 4: sum.sourceSlots = []
+     *
+     * // Now sum is clean, ready to re-execute and create new dependencies
+     * ```
+     */
+    // Notify all observers
+    if (node.observers?.length) {
+      runUpdates(() => {
+        for (let i = 0; i < node.observers!.length; i++) {
+          const obs = node.observers![i]!;
+
+          // Mark as stale
+          if (obs.state === FRESH) {
+            if (obs.pure) Updates!.push(obs); // Memo: add to Updates
+            else Effects!.push(obs); // Effect: add to Effect
+
+            // If this is a memo with observers, mark them too
+            if ((obs as Memo<any>).observers?.length) {
+              markDownstream(obs as Memo<any>);
+            }
+          }
+          obs.state = STALE;
+        }
+      }, false);
+    }
+  }
+
+  return node.value;
+}
+
+/**
+ * Marks all downstream computations as stale
+ * Used when a memo changes to invalidate dependent computations
+ */
+function markDownstream(node: Memo<any>): void {
+  for (let i = 0; i < node.observers!.length; i++) {
+    const obs = node.observers![i]!;
+
+    if (obs.state === FRESH) {
+      obs.state = PENDING; // Mark as pending (not stale yet)
+      if (obs.pure) Updates!.push(obs); // Memo: add to Updates
+      else Effects!.push(obs); // Effect: add to Effect
+
+      // Recursively mark downstream
+      if ((obs as Memo<any>).observers?.length) {
+        markDownstream(obs as Memo<any>);
+      }
+    }
+  }
+}
+
+/**
+ * Core update cycle
+ * Sets up queues, runs function, then completes updates
+ */
+function runUpdates(fn: () => void, init: boolean) {
+  // TODO: to be implemented in later iterations
+  return fn();
 }

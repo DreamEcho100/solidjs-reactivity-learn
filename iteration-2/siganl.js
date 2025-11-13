@@ -129,7 +129,7 @@
  * @typedef {object} SignalState
  * @property {T} value Current value of the signal
  * @property {Computation<any>[]} observers Set of observers subscribed to this signal
- * @property {number[] | null} observerSots Array of observer slots (for optimization), or null if not used
+ * @property {number[] | null} observerSlots Array of observer slots (for optimization), or null if not used
  *
  * ### Bidirectional Tracking
  *

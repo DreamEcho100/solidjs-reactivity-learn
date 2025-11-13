@@ -224,12 +224,12 @@ export type Signal<T> = [get: Accessor<T>, set: Setter<T>];
  * Internal state for a signal
  * Contains the value and dependency tracking information
  */
-interface SignalState<T> {
+export interface SignalState<T> {
   /** Current value of the signal */
   value: T;
 
   /** Computations that depend on this signal */
-  observers: Computation<any>[] | null;
+  observers: Computation<any, any>[] | null;
 
   /** Index of this signal in each observer's sources array (for O(1) removal) */
   observerSlots: number[] | null;
@@ -336,7 +336,7 @@ export interface Computation<Init, Next extends Init = Init> extends Owner {
   /** The function to execute */
   fn: EffectFunction<Init, Next>;
 
-  /** Current state (0=clean, 1=stale, 2=pending) */
+  /** Current state (0=FRESH, 1=STALE, 2=PENDING) */
   state: ComputationState;
 
   /** Transition state (concurrent mode) */
