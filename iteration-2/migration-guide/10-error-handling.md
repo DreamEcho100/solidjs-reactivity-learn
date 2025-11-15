@@ -53,29 +53,145 @@ export function onError(fn: (err: any) => void): void {
 
 ### Step 3: Handle Errors in Computations
 
+**Error Propagation Through Owner Chain:**
+
 ```typescript
-function handleError(err: any): void {
-  const fns = lookup(Owner, ERROR);
-  
-  if (!fns) {
-    // No error boundary, throw globally
-    if (globalErrorHandlers.length) {
-      globalErrorHandlers.forEach(h => h(err));
-    } else {
-      throw err;
-    }
-  } else {
-    // Call error handlers
+/**
+ * Cast error to Error object
+ */
+function castError(err: unknown): Error {
+  if (err instanceof Error) return err;
+  return new Error(typeof err === "string" ? err : "Unknown error", { cause: err });
+}
+
+/**
+ * Run multiple error handlers
+ */
+function runErrors(
+  err: unknown,
+  fns: ((err: any) => void)[],
+  owner: Owner | null
+): void {
+  try {
     for (const f of fns) {
-      try {
-        f(err);
-      } catch (e) {
-        // Error in error handler, escalate
-        handleError(e);
-      }
+      f(err);
     }
+  } catch (e) {
+    // Error in error handler, bubble up to parent
+    handleError(e, (owner && owner.owner) || null);
   }
 }
+
+/**
+ * Handle error by finding error boundary in owner chain
+ */
+function handleError(err: unknown, owner = Owner): void {
+  const fns = ERROR && owner && owner.context && owner.context[ERROR];
+  const error = castError(err);
+  
+  if (!fns) {
+    // No error boundary found, throw globally
+    throw error;
+  }
+  
+  // If we're in an update cycle, queue error handling
+  if (Effects) {
+    Effects.push({
+      fn() {
+        runErrors(error, fns, owner);
+      },
+      state: STALE
+    } as unknown as Computation<any>);
+  } else {
+    // Run immediately
+    runErrors(error, fns, owner);
+  }
+}
+```
+
+**Why Queue Errors During Updates?**
+
+```
+Without queuing:
+┌─────────────────────────────────────┐
+│ Update Cycle Running                │
+│   ├─ Memo 1 throws error            │
+│   │   └─ handleError runs           │
+│   │       └─ Changes state!         │
+│   ├─ Memo 2 (corrupted state!) ❌   │
+│   └─ Effect 1 (never runs!) ❌      │
+└─────────────────────────────────────┘
+
+With queuing:
+┌─────────────────────────────────────┐
+│ Update Cycle Running                │
+│   ├─ Memo 1 throws error            │
+│   │   └─ Queue error handler        │
+│   ├─ Memo 2 (continues normally) ✓  │
+│   └─ Effect 1 (runs normally) ✓     │
+│                                     │
+│ After Update Cycle:                 │
+│   └─ Run error handlers ✓           │
+└─────────────────────────────────────┘
+```
+
+**Error Bubbling Example:**
+
+```typescript
+// Owner chain:
+// Root → ComponentA → ComponentB → createEffect
+
+createRoot(() => {
+  // Root level (no error handler)
+  
+  function ComponentA() {
+    // Error boundary here
+    onError((err) => {
+      console.log("ComponentA caught:", err);
+    });
+    
+    function ComponentB() {
+      // No error handler
+      
+      createEffect(() => {
+        throw new Error("Something broke!");
+        // Error bubbles up:
+        // 1. Check ComponentB context (none)
+        // 2. Check ComponentA context (found!)
+        // 3. Call handler
+      });
+    }
+    
+    ComponentB();
+  }
+  
+  ComponentA();
+});
+```
+
+**Multiple Error Boundaries:**
+
+```typescript
+createRoot(() => {
+  onError((err) => {
+    console.log("Outer boundary:", err);
+  });
+  
+  function Inner() {
+    onError((err) => {
+      console.log("Inner boundary:", err);
+      // If this throws, outer boundary catches it!
+    });
+    
+    createEffect(() => {
+      throw new Error("Inner error");
+      // Caught by inner boundary first
+    });
+  }
+  
+  Inner();
+});
+```
 
 function lookup(owner: Owner | null, key: symbol | string): any {
   return (

@@ -419,26 +419,173 @@ setTrigger(true);
 
 ## 📊 Scheduling Priorities
 
+### The Three Effect Types
+
 ```
-Priority Level 1: createComputed
-  - Runs immediately when created
-  - Updates queue: [computation]
-  - Used for derived values that should always be current
+┌────────────────────────────────────────────┐
+│ HIGH PRIORITY (Updates Queue)              │
+│ • createComputed (pure: true)              │
+│ • createMemo (pure: true)                  │
+│ • Runs FIRST                               │
+│ • Can have observers                       │
+│ • Computes derived values                  │
+└─────────────────────┬──────────────────────┘
+                      ↓
+┌────────────────────────────────────────────┐
+│ MEDIUM PRIORITY (Effects Queue)            │
+│ • createRenderEffect (pure: false)         │
+│ • user: false                              │
+│ • Runs SECOND                              │
+│ • DOM manipulation, refs                   │
+│ • Before user sees changes                 │
+└─────────────────────┬──────────────────────┘
+                      ↓
+┌────────────────────────────────────────────┐
+│ LOW PRIORITY (Effects Queue, Deferred)     │
+│ • createEffect (pure: false)               │
+│ • user: true                               │
+│ • Runs LAST                                │
+│ • Side effects, logging, analytics         │
+│ • After DOM is stable                      │
+└────────────────────────────────────────────┘
+```
 
-Priority Level 2: createRenderEffect  
-  - Runs during render phase
-  - Effects queue: [renderEffect]
-  - Used for DOM updates before visible
+### Why This Order Matters
 
-Priority Level 3: createEffect (user: false)
-  - Runs in effects queue
-  - Regular priority
-  - For most side effects
+**createComputed:**
+```typescript
+// Runs immediately in Updates queue
+const [count, setCount] = createSignal(0);
 
-Priority Level 4: createEffect (user: true)
-  - Runs after render effects
-  - Deferred until render complete
-  - For non-critical side effects
+createComputed(() => {
+  console.log("Computed:", count());
+  // Always sees latest value
+  // Can have observers
+});
+```
+
+**createRenderEffect:**
+```typescript
+// Runs in Effects queue, before user effects
+let ref;
+
+createRenderEffect(() => {
+  // DOM manipulation happens here
+  ref.textContent = count();
+  ref.style.color = "blue";
+});
+// User sees updated DOM immediately
+```
+
+**createEffect:**
+```typescript
+// Runs AFTER render effects
+createEffect(() => {
+  // Side effects happen here
+  console.log("Count changed:", count());
+  analytics.track("count_change", count());
+});
+// DOM is already updated and stable
+```
+
+### The runUserEffects Implementation
+
+Solid.js uses **two separate runners** for effects:
+
+```typescript
+// From signal.ts
+let runEffects = runQueue; // Default runner
+
+export function createEffect<Next>(
+  fn: EffectFunction<undefined | NoInfer<Next>, Next>
+): void {
+  runEffects = runUserEffects; // ← Switch to user effect runner
+  const c = createComputation(fn, undefined!, false, STALE);
+  c.user = true; // Mark as user effect
+  
+  if (Effects) {
+    Effects.push(c);
+  } else {
+    updateComputation(c);
+  }
+}
+
+/**
+ * Runs render effects before user effects
+ */
+function runUserEffects(queue: Computation<any>[]): void {
+  let i, userLength = 0;
+  
+  // Phase 1: Run render effects (user: false)
+  for (i = 0; i < queue.length; i++) {
+    const e = queue[i];
+    if (!e.user) {
+      runTop(e); // DOM updates happen here
+    } else {
+      queue[userLength++] = e; // Collect user effects
+    }
+  }
+  
+  // Phase 2: Run user effects (user: true)
+  for (i = 0; i < userLength; i++) {
+    runTop(queue[i]); // Side effects happen here
+  }
+}
+```
+
+### Execution Flow Example
+
+```typescript
+const [count, setCount] = createSignal(0);
+
+// Updates queue
+const doubled = createMemo(() => {
+  console.log("1. Memo:", count() * 2);
+  return count() * 2;
+});
+
+// Effects queue (render effect)
+createRenderEffect(() => {
+  console.log("2. Render effect:", doubled());
+  document.title = `Count: ${doubled()}`;
+});
+
+// Effects queue (user effect)
+createEffect(() => {
+  console.log("3. User effect:", doubled());
+  localStorage.setItem("count", doubled().toString());
+});
+
+setCount(5);
+
+/* Output:
+1. Memo: 10
+2. Render effect: 10
+3. User effect: 10
+
+Order guaranteed:
+- Memos computed first (stable values)
+- Render effects (DOM updates)
+- User effects (side effects)
+*/
+```
+
+### Priority Testing
+
+```typescript
+test("effect priority order", () => {
+  const log: string[] = [];
+  const [s, setS] = createSignal(0);
+  
+  createComputed(() => log.push("computed"));
+  createRenderEffect(() => log.push("render"));
+  createEffect(() => log.push("effect"));
+  
+  log.length = 0;
+  setS(1);
+  
+  expect(log).toEqual(["computed", "render", "effect"]);
+});
 ```
 
 ## ✅ Implementation Checklist
