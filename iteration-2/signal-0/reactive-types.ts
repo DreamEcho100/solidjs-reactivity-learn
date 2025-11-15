@@ -1,6 +1,6 @@
 /** biome-ignore-all lint/suspicious/noEmptyInterface: <explanation> */
 
-import type { FRESH, STALE, PENDING } from "./constants.ts";
+import type { CLEAN, STALE, PENDING } from "./constants.ts";
 /**
  * @fileoverview
  *
@@ -191,7 +191,7 @@ type Comparator<T> = (a: T, b: T) => boolean;
  * - Glitch-free: Prevents temporary inconsistent states
  * - Efficiency: Skip unnecessary work
  */
-export type ComputationState = typeof FRESH | typeof STALE | typeof PENDING;
+export type ComputationState = typeof CLEAN | typeof STALE | typeof PENDING;
 
 /**
  * Generic accessor function type

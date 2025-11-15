@@ -1,7 +1,7 @@
 import type { Owner } from "./reactive-types.ts";
 
 /** Computation is up to date */
-export const FRESH = 0;
+export const CLEAN = 0;
 /** Computation may need to recompute */
 export const STALE = 1;
 /** Computation is waiting on upstream dependencies */

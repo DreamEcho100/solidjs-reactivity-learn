@@ -521,6 +521,230 @@ test("no glitches", () => {
 });
 ```
 
+## 🔄 The Complete runUpdates Implementation
+
+Now that we have states, here's the **complete** `runUpdates` that handles everything:
+
+```typescript
+/**
+ * Core update cycle - orchestrates marking and flushing
+ * This is what makes the state machine work!
+ */
+function runUpdates<T>(fn: () => T, init: boolean): T {
+  // Prevent nested flush cycles
+  if (Updates) {
+    return fn();
+  }
+  
+  // Initialize queues and increment timestamp
+  Updates = [];
+  Effects = [];
+  ExecCount++;  // For glitch prevention
+  
+  try {
+    // Phase 1: Mark phase (add to queues)
+    const result = fn();
+    
+    // Phase 2: Flush Updates (memos) with topological ordering
+    for (let i = 0; i < Updates.length; i++) {
+      const node = Updates[i]!;
+      runTop(node);  // Updates upstream first if needed
+    }
+    
+    // Phase 3: Flush Effects (only if init=true)
+    if (init) {
+      for (let i = 0; i < Effects.length; i++) {
+        const node = Effects[i]!;
+        runTop(node);  // Updates upstream first if needed
+      }
+    }
+    
+    return result;
+  } finally {
+    // Cleanup
+    Updates = null;
+    if (init) Effects = null;
+  }
+}
+
+/**
+ * Run computation with topological ordering
+ * Ensures parents update before children
+ */
+function runTop(node: Computation<any>): void {
+  // Already clean? Nothing to do
+  if (node.state === CLEAN) return;
+  
+  // If PENDING, check upstream first
+  if (node.state === PENDING) {
+    const prevUpdates = Updates;
+    Updates = null;
+    runUpdates(() => lookUpstream(node), false);
+    Updates = prevUpdates;
+    return;
+  }
+  
+  // Collect ancestors that need updating
+  const ancestors: Computation<any>[] = [node];
+  let current = node.owner as Computation<any>;
+  
+  while (current && (!current.updatedAt || current.updatedAt < ExecCount)) {
+    if (current.state !== CLEAN) {
+      ancestors.push(current);
+    }
+    current = current.owner as Computation<any>;
+  }
+  
+  // Update from top down (parents before children)
+  for (let i = ancestors.length - 1; i >= 0; i--) {
+    const ancestor = ancestors[i]!;
+    
+    if (ancestor.state === STALE) {
+      updateComputation(ancestor);
+    } else if (ancestor.state === PENDING) {
+      const prevUpdates = Updates;
+      Updates = null;
+      runUpdates(() => lookUpstream(ancestor), false);
+      Updates = prevUpdates;
+    }
+  }
+}
+
+/**
+ * Check if upstream dependencies need updating
+ * Used for PENDING computations
+ */
+function lookUpstream(node: Computation<any>): void {
+  node.state = CLEAN;
+  
+  for (let i = 0; i < node.sources!.length; i++) {
+    const source = node.sources![i] as Memo<any>;
+    
+    // Skip signals (they're always current)
+    if (!source.sources) continue;
+    
+    const state = source.state;
+    if (state === STALE) {
+      // Source needs updating and hasn't been updated yet
+      if (!source.updatedAt || source.updatedAt < ExecCount) {
+        runTop(source);
+      }
+    } else if (state === PENDING) {
+      // Source is pending, recurse
+      lookUpstream(source);
+    }
+  }
+}
+```
+
+### How It All Works Together
+
+```typescript
+// Complete flow with states:
+const [a, setA] = createSignal(1);
+const [b, setB] = createSignal(2);
+
+const sum = createMemo(() => a() + b());
+const doubled = createMemo(() => sum() * 2);
+
+createEffect(() => {
+  console.log(doubled());
+});
+
+// Initial: all CLEAN
+// sum.state = 0
+// doubled.state = 0
+// effect.state = 0
+
+setA(5);  // Triggers writeSignal
+
+// ┌─ writeSignal ────────────────────────────────────┐
+// │ 1. a.value = 5                                   │
+// │ 2. runUpdates(() => { ... }, true)               │
+// └──────────────────────────────────────────────────┘
+//
+// ┌─ runUpdates Phase 1: Initialize ─────────────────┐
+// │ Updates = []                                     │
+// │ Effects = []                                     │
+// │ ExecCount++ (now = 1)                            │
+// └──────────────────────────────────────────────────┘
+//
+// ┌─ runUpdates Phase 2: Mark ───────────────────────┐
+// │ fn() executes:                                   │
+// │   sum.state = STALE                              │
+// │   Updates.push(sum)                              │
+// │   markDownstream(sum):                           │
+// │     doubled.state = PENDING                      │
+// │     Updates.push(doubled)                        │
+// │     markDownstream(doubled):                     │
+// │       effect.state = PENDING                     │
+// │       Effects.push(effect)                       │
+// └──────────────────────────────────────────────────┘
+//
+// ┌─ runUpdates Phase 3: Flush Updates ──────────────┐
+// │ for (sum in Updates):                            │
+// │   runTop(sum):                                   │
+// │     sum.state === STALE                          │
+// │     updateComputation(sum)                       │
+// │     sum.value = 7                                │
+// │     sum.state = CLEAN                            │
+// │     sum.updatedAt = 1                            │
+// │                                                  │
+// │ for (doubled in Updates):                        │
+// │   runTop(doubled):                               │
+// │     doubled.state === PENDING                    │
+// │     lookUpstream(doubled):                       │
+// │       check sum: state=CLEAN, updatedAt=1 ✓      │
+// │     updateComputation(doubled)                   │
+// │     doubled.value = 14                           │
+// │     doubled.state = CLEAN                        │
+// └──────────────────────────────────────────────────┘
+//
+// ┌─ runUpdates Phase 4: Flush Effects ──────────────┐
+// │ for (effect in Effects):                         │
+// │   runTop(effect):                                │
+// │     effect.state === PENDING                     │
+// │     lookUpstream(effect):                        │
+// │       check doubled: state=CLEAN ✓               │
+// │     updateComputation(effect)                    │
+// │     console.log(14)  ← Side effect!              │
+// │     effect.state = CLEAN                         │
+// └──────────────────────────────────────────────────┘
+//
+// ┌─ runUpdates Phase 5: Cleanup ────────────────────┐
+// │ Updates = null                                   │
+// │ Effects = null                                   │
+// └──────────────────────────────────────────────────┘
+//
+// Final: all CLEAN again, consistent values! ✨
+```
+
+### Why This Achieves All Six Goals
+
+1. **Lazy Evaluation** ✅
+   - Computations marked STALE but only update during flush
+   - If never accessed, never computed
+
+2. **State Machine** ✅
+   - CLEAN → STALE → PENDING → CLEAN cycle
+   - Clear lifecycle management
+
+3. **Glitch Prevention** ✅
+   - ExecCount timestamp ensures we see updates once
+   - lookUpstream checks prevent reading stale values
+
+4. **Topological Ordering** ✅
+   - runTop walks up owner chain
+   - Updates parents before children
+
+5. **Performance** ✅
+   - Batch updates in runUpdates
+   - Process once per cycle, not per signal change
+
+6. **Correctness** ✅
+   - PENDING state ensures upstream consistency
+   - Only see final, stable values
+
 ## 🚀 Next Step
 
 Continue to **[06-effect-scheduling.md](./06-effect-scheduling.md)** to implement proper effect queuing and execution order.

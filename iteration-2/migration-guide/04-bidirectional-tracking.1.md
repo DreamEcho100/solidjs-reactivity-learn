@@ -916,9 +916,164 @@ They point to each other! 🔄
 
 ---
 
+## 🚀 The Missing Piece: runUpdates Function
+
+### 🎯 What We Haven't Covered Yet
+
+You might be wondering: **"When do the effects actually RUN?"**
+
+Great question! We've covered:
+- ✅ How to track dependencies (bidirectional links)
+- ✅ How to mark things as needing updates (STALE state)
+- ✅ How to add them to queues (Updates and Effects arrays)
+
+But we haven't covered: **The flush mechanism!**
+
+### The runUpdates Function
+
+This is the **orchestrator** that makes everything work:
+
+```javascript
+function runUpdates(fn, init) {
+  // If already flushing, just run the function
+  if (Updates) {
+    return fn();
+  }
+  
+  // 1️⃣ Initialize queues
+  Updates = [];
+  Effects = [];
+  ExecCount++;  // For topological ordering
+  
+  try {
+    // 2️⃣ Run the marking function
+    fn();  // This adds computations to Updates and Effects
+    
+    // 3️⃣ Flush Updates (memos)
+    for (let i = 0; i < Updates.length; i++) {
+      updateComputation(Updates[i]);
+    }
+    
+    // 4️⃣ Flush Effects (side effects)
+    if (init) {
+      for (let i = 0; i < Effects.length; i++) {
+        updateComputation(Effects[i]);
+      }
+    }
+  } finally {
+    // 5️⃣ Clean up
+    Updates = null;
+    if (init) Effects = null;
+  }
+}
+```
+
+### When It Gets Called
+
+```javascript
+// Inside writeSignal (when you call setSignal):
+function writeSignal(signal, newValue) {
+  signal.value = newValue;
+  
+  // THIS IS WHERE THE MAGIC HAPPENS! 🎉
+  runUpdates(() => {
+    // Mark all observers as needing updates
+    for (const observer of signal.observers) {
+      observer.state = STALE;
+      if (observer.pure) Updates.push(observer);
+      else Effects.push(observer);
+    }
+  }, true);
+}
+```
+
+### The Complete Flow
+
+```
+┌─────────────────────────────────────────────────────────┐
+│ User calls: setCount(5)                                 │
+└─────────────────────┬───────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────┐
+│ writeSignal runs:                                       │
+│ 1. count.value = 5                                      │
+│ 2. Call runUpdates(...)                                 │
+└─────────────────────┬───────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────┐
+│ runUpdates Phase 1: Initialize                          │
+│ - Updates = []                                          │
+│ - Effects = []                                          │
+│ - ExecCount++                                           │
+└─────────────────────┬───────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────┐
+│ runUpdates Phase 2: Mark (fn executes)                  │
+│ - memo.state = STALE                                    │
+│ - Updates.push(memo)                                    │
+│ - effect.state = STALE                                  │
+│ - Effects.push(effect)                                  │
+└─────────────────────┬───────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────┐
+│ runUpdates Phase 3: Flush Updates                       │
+│ - Run memo.fn()                                         │
+│ - memo.state = CLEAN                                    │
+│ - memo.value = 10                                       │
+└─────────────────────┬───────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────┐
+│ runUpdates Phase 4: Flush Effects                       │
+│ - Run effect.fn()                                       │
+│ - effect.state = CLEAN                                  │
+│ - console.log(10) ← Side effect happens!                │
+└─────────────────────┬───────────────────────────────────┘
+                      ↓
+┌─────────────────────────────────────────────────────────┐
+│ runUpdates Phase 5: Cleanup                             │
+│ - Updates = null                                        │
+│ - Effects = null                                        │
+└─────────────────────┬───────────────────────────────────┘
+                      ↓
+                   Done! ✨
+```
+
+### Why You Need This
+
+**Without runUpdates:**
+```javascript
+setA(5);   // Marks STALE... but nothing happens! ❌
+setB(10);  // Marks STALE... but nothing happens! ❌
+// Effects sit in queue forever!
+```
+
+**With runUpdates:**
+```javascript
+setA(5);   // Marks STALE → Flushes → Effects run! ✅
+setB(10);  // Marks STALE → Flushes → Effects run! ✅
+// Everything executes properly!
+```
+
+### Think of It Like a Restaurant Kitchen 🍳
+
+```
+📝 Order comes in (setSignal called)
+     ↓
+📋 Add to cooking queue (mark STALE)
+     ↓
+🔥 Flush queue: Cook all meals (runUpdates)
+     ↓
+🍽️ Serve to customers (effects execute)
+```
+
+**runUpdates is the chef** that:
+1. Collects all orders (marks STALE)
+2. Cooks them in the right order (Updates then Effects)
+3. Serves them all at once (flush)
+
 ## 🚀 Next Steps
 
-Now that you understand bidirectional tracking, you're ready to learn about:
+Now that you understand bidirectional tracking AND when flushes happen, you're ready to learn about:
 
 **[05-computation-states.md](./05-computation-states.md)** - How to implement lazy evaluation with state machines!
 
@@ -932,6 +1087,11 @@ Now that you understand bidirectional tracking, you're ready to learn about:
 - Adding and removing is instant ⚡
 - It scales to thousands of contacts effortlessly 🚀
 
+**And runUpdates is like the postal service** that:
+- Collects all mail (marks changes) 📬
+- Sorts it efficiently (Updates vs Effects) 📦
+- Delivers everything in one trip (flush) 🚚
+
 This is the secret sauce that makes Solid.js one of the fastest reactive frameworks! 🎉
 
 ---
@@ -943,5 +1103,6 @@ Think of these analogies:
 - 🎭 Theater with assigned seats
 - 💃 Dance hall with partner cards
 - 📊 Excel with automatic formulas
+- 🍳 Restaurant kitchen with order queue
 
 The key insight: **When both sides remember their connection, everything becomes instant!**

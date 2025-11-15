@@ -1068,9 +1068,248 @@ if (memo.state === PENDING) {
 
 ---
 
+## 🎬 The Complete Picture: runUpdates Orchestration
+
+### When Does the Flush Actually Happen?
+
+Great question! Let me show you **exactly** when and how everything runs:
+
+```javascript
+// This is what you write:
+setEggs(3);
+
+// This is what actually happens:
+writeSignal(eggsSignal, 3)
+  ↓
+runUpdates(() => {
+  // Mark phase
+  for (observer of eggsSignal.observers) {
+    observer.state = STALE;
+    Updates.push(observer);  // or Effects.push(observer)
+  }
+}, true);  // ← true = flush effects immediately
+  ↓
+// Now runUpdates does its magic:
+  
+// 1️⃣ Initialize
+Updates = [];
+Effects = [];
+ExecCount++;
+
+// 2️⃣ Mark (the function above runs)
+//    omeletteMemo.state = STALE
+//    Updates = [omeletteMemo]
+
+// 3️⃣ Flush Updates (memos)
+for (memo of Updates) {
+  runTop(memo);  // Actually computes the memo
+}
+
+// 4️⃣ Flush Effects
+for (effect of Effects) {
+  runTop(effect);  // Runs the side effects
+}
+
+// 5️⃣ Cleanup
+Updates = null;
+Effects = null;
+
+// Done! Everything is consistent! ✨
+```
+
+### The runUpdates Function (Complete)
+
+```javascript
+function runUpdates(fn, init) {
+  // Already flushing? Just run the function
+  if (Updates) {
+    return fn();
+  }
+  
+  // Initialize queues
+  Updates = [];
+  Effects = [];
+  ExecCount++;  // For topological ordering
+  
+  try {
+    // Phase 1: Mark (fn executes, adds to queues)
+    fn();
+    
+    // Phase 2: Flush Updates (memos)
+    for (let i = 0; i < Updates.length; i++) {
+      const node = Updates[i];
+      runTop(node);  // Compute with proper ordering
+    }
+    
+    // Phase 3: Flush Effects (if init=true)
+    if (init) {
+      for (let i = 0; i < Effects.length; i++) {
+        const node = Effects[i];
+        runTop(node);  // Run side effects
+      }
+    }
+  } finally {
+    // Phase 4: Cleanup
+    Updates = null;
+    if (init) Effects = null;
+  }
+}
+```
+
+### How runTop Ensures Topological Ordering
+
+```javascript
+function runTop(node) {
+  // Already clean? Skip
+  if (node.state === CLEAN) return;
+  
+  // If PENDING, check upstream first
+  if (node.state === PENDING) {
+    lookUpstream(node);
+  }
+  
+  // Collect ancestors that need updating
+  const ancestors = [node];
+  let parent = node.owner;
+  
+  while (parent && parent.state !== CLEAN) {
+    ancestors.push(parent);
+    parent = parent.owner;
+  }
+  
+  // Update from top to bottom (parents first!)
+  for (let i = ancestors.length - 1; i >= 0; i--) {
+    const ancestor = ancestors[i];
+    
+    if (ancestor.state === STALE) {
+      updateComputation(ancestor);  // Actually compute
+      ancestor.state = CLEAN;
+    }
+  }
+}
+```
+
+### The Complete Flow Visualized
+
+```
+User Action:
+setEggs(3);
+    ↓
+┌───────────────────────────────────────────────────┐
+│ writeSignal(eggsSignal, 3)                        │
+│   1. eggsSignal.value = 3                         │
+│   2. Call runUpdates(markFn, true)                │
+└─────────────────┬─────────────────────────────────┘
+                  ↓
+┌───────────────────────────────────────────────────┐
+│ runUpdates Phase: Initialize                      │
+│   Updates = []                                    │
+│   Effects = []                                    │
+│   ExecCount++ (now = 1)                           │
+└─────────────────┬─────────────────────────────────┘
+                  ↓
+┌───────────────────────────────────────────────────┐
+│ runUpdates Phase: Mark                            │
+│   markFn() executes:                              │
+│     omeletteMemo.state = STALE                    │
+│     Updates.push(omeletteMemo)                    │
+│     markDownstream(omeletteMemo):                 │
+│       serveEffect.state = PENDING                 │
+│       Effects.push(serveEffect)                   │
+└─────────────────┬─────────────────────────────────┘
+                  ↓
+┌───────────────────────────────────────────────────┐
+│ runUpdates Phase: Flush Updates                   │
+│   for omeletteMemo in Updates:                    │
+│     runTop(omeletteMemo)                          │
+│       omeletteMemo.state === STALE                │
+│       updateComputation(omeletteMemo)             │
+│         console.log("🍳 Cooking omelette...")     │
+│         omeletteMemo.value = "Omelette with 3..."│
+│         omeletteMemo.state = CLEAN                │
+│         omeletteMemo.updatedAt = 1                │
+└─────────────────┬─────────────────────────────────┘
+                  ↓
+┌───────────────────────────────────────────────────┐
+│ runUpdates Phase: Flush Effects                   │
+│   for serveEffect in Effects:                     │
+│     runTop(serveEffect)                           │
+│       serveEffect.state === PENDING               │
+│       lookUpstream(serveEffect):                  │
+│         check omeletteMemo: CLEAN & updatedAt=1✓  │
+│       updateComputation(serveEffect)              │
+│         console.log("🍽️ Serving...")             │
+│         serveEffect.state = CLEAN                 │
+└─────────────────┬─────────────────────────────────┘
+                  ↓
+┌───────────────────────────────────────────────────┐
+│ runUpdates Phase: Cleanup                         │
+│   Updates = null                                  │
+│   Effects = null                                  │
+└─────────────────┬─────────────────────────────────┘
+                  ↓
+               Done! ✨
+All states CLEAN
+All values consistent
+No glitches!
+```
+
+### Answering Your Question Directly
+
+**When does the flush happen for the 6 goals?**
+
+1. **Lazy Evaluation** 🎯
+   - Flush happens in `runUpdates` when you call `setSignal()`
+   - Or when you read a memo that's STALE
+
+2. **State Machine** 🎯
+   - States transition during flush:
+   - CLEAN → STALE (during mark)
+   - STALE → CLEAN (during flush updates)
+   - PENDING → CLEAN (during flush after lookUpstream)
+
+3. **Glitch Prevention** 🎯
+   - Flush waits for mark phase to complete
+   - All signals updated before any computation runs
+   - ExecCount ensures one-time updates per cycle
+
+4. **Topological Ordering** 🎯
+   - Flush uses `runTop()` which walks up owner chain
+   - Parents compute before children
+   - `lookUpstream()` ensures dependencies are fresh
+
+5. **Performance** 🎯
+   - Flush batches all updates
+   - One flush per `setSignal()` call (or batch)
+   - Multiple signal changes → one flush (with batch)
+
+6. **Correctness** 🎯
+   - Flush separates Updates (memos) from Effects
+   - Memos flush first (stable values)
+   - Effects flush second (see stable values)
+
+### The Key Insight
+
+```
+Mark Phase:    "Ingredients changed!"
+               (State → STALE/PENDING)
+                        ↓
+Flush Phase:   "Cook everything NOW!"
+               (Compute → State → CLEAN)
+                        ↓
+Result:        "Perfect meal, no waste!"
+               (Consistent, efficient)
+```
+
+**runUpdates is the chef** 👨‍🍳 that:
+- Collects all orders (mark phase)
+- Cooks in optimal order (Updates → Effects)
+- Serves everything fresh (flush phase)
+- Cleans up the kitchen (cleanup phase)
+
 ## 🚀 Next Steps
 
-Now that you understand computation states, you're ready to learn about:
+Now that you understand computation states AND when flushes happen, you're ready to learn about:
 
 **[06-effect-scheduling.md](./06-effect-scheduling.md)** - How to implement proper effect queuing and execution order!
 
@@ -1084,6 +1323,12 @@ Now that you understand computation states, you're ready to learn about:
 - Cook in the right order (topological) 📊
 - Serve one perfect meal (efficiency) ✨
 
+**And runUpdates is the head chef** 👨‍🍳 that:
+- Takes all orders at once (batching) 📝
+- Preps ingredients first (Updates/memos) 🥗
+- Cooks the main course (Effects) 🍖
+- Serves everything fresh (consistency) 🍽️
+
 This is how Solid.js stays fast and glitch-free! 🎉
 
 ---
@@ -1095,5 +1340,6 @@ Remember these key insights:
 - **States** = Traffic lights for computations
 - **Glitches** = Seeing wrong intermediate values
 - **Prevention** = Update all at once, show only final values
+- **Flush** = The moment everything gets computed and executed
 
 The key insight: **Mark now, compute later, show correct values!** ✨

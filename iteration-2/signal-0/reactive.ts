@@ -1,6 +1,6 @@
 /** biome-ignore-all lint/suspicious/noAssignInExpressions: <explanation> */
 import type { Memo, MemoOptions, SignalState } from "./reactive-types.ts";
-import { FRESH, IS_DEV, PENDING, STALE, UNOWNED_OWNER } from "./constants.ts";
+import { CLEAN, IS_DEV, PENDING, STALE, UNOWNED_OWNER } from "./constants.ts";
 import type {
   Owner,
   Computation,
@@ -8,6 +8,140 @@ import type {
   ComputationState,
   EffectOptions,
 } from "./reactive-types.ts";
+
+/**
+ * @fileoverview
+ *
+ * ## 🎨 Example: State Machine in Action
+ *
+ * ### Code
+ *
+ * ```typescript
+ * const [a, setA] = createSignal(1);
+ * const [b, setB] = createSignal(2);
+ *
+ * const sum = createMemo(() => {
+ *   console.log("Computing sum");
+ *   return a() + b();
+ * });
+ *
+ * const doubled = createMemo(() => {
+ *   console.log("Computing doubled");
+ *   return sum() * 2;
+ * });
+ *
+ * createEffect(() => {
+ *   console.log("Result:", doubled());
+ * });
+ * ```
+ *
+ *
+ * ### Execution Flow
+ *
+ * ```
+ * Initial:
+ *   sum.state = 0 (CLEAN)
+ *   doubled.state = 0 (CLEAN)
+ *   effect.state = 0 (CLEAN)
+ *
+ * setA(5):
+ *   1. writeSignal(a, 5)
+ *   2. sum.state = STALE
+ *   3. Add sum to Updates queue
+ *
+ *   4. markDownstream(sum)
+ *   5. doubled.state = PENDING
+ *   6. Add doubled to Updates queue
+ *
+ *   7. markDownstream(doubled)
+ *   8. effect.state = PENDING
+ *   9. Add effect to Effects queue
+ *
+ * Flush Updates:
+ *   10. runTop(sum)
+ *       - sum.state === STALE
+ *       - updateComputation(sum)
+ *       - Logs: "Computing sum"
+ *       - sum.value = 7
+ *       - sum.state = 0 (CLEAN)
+ *       - sum.updatedAt = ExecCount
+ *
+ *   11. runTop(doubled)
+ *       - doubled.state === PENDING
+ *       - lookUpstream(doubled)
+ *         - Check sum: state = 0, updatedAt = ExecCount ✓
+ *       - updateComputation(doubled)
+ *       - Logs: "Computing doubled"
+ *       - doubled.value = 14
+ *       - doubled.state = 0 (CLEAN)
+ *
+ * Flush Effects:
+ *   12. runTop(effect)
+ *       - effect.state === PENDING
+ *       - lookUpstream(effect)
+ *         - Check doubled: state = 0 ✓
+ *       - updateComputation(effect)
+ *       - Logs: "Result: 14"
+ *       - effect.state = 0 (CLEAN)
+ *
+ * Final state:
+ *   All computations CLEAN
+ *   All values consistent
+ *   No glitches! 🎉
+ * ```
+ *
+ * ## 🔍 Why This Matters
+ *
+ * ### 1. Lazy Evaluation
+ *
+ * ```typescript
+ * const expensive = createMemo(() => {
+ *   console.log("Expensive computation");
+ *   return heavyCalculation();
+ * });
+ *
+ * // Signal changes, but memo not read
+ * setSignal(newValue);
+ * // memo.state = STALE, but NOT computed yet
+ *
+ * // Only computed when accessed
+ * console.log(expensive()); // ← Now it computes
+ * ```
+ *
+ * ### 2. Glitch Prevention
+ *
+ * ```typescript
+ * const [x, setX] = createSignal(1);
+ * const [y, setY] = createSignal(2);
+ *
+ * const sum = createMemo(() => x() + y());
+ * const product = createMemo(() => sum() * 2);
+ *
+ * batch(() => {
+ *   setX(5);  // sum.state = STALE
+ *   setY(10); // sum already STALE
+ * });
+ *
+ * // sum only computes once with final values: (5 + 10) * 2 = 30
+ * // Without states: would compute (5 + 2) * 2 = 14, then (5 + 10) * 2 = 30
+ * ```
+ *
+ * ### 3. Topological Ordering
+ *
+ * ```typescript
+ * //     A
+ * //    / \
+ * //   B   C
+ * //    \ /
+ * //     D
+ *
+ * setA(newValue);
+ *
+ * // Update order: A → B → C → D
+ * // Guaranteed: parents before children
+ * // D always sees consistent B and C values
+ * ```
+ */
 
 /*
  * ```
@@ -72,6 +206,10 @@ export let Effects: Computation<any>[] | null = null;
 // const Transition: TransitionState;
 // const Scheduler: Function;
 
+/**
+ * Global execution counter for topological ordering
+ * Incremented on each update cycle
+ */
 let ExecCount = 0;
 const defaultComparator = Object.is;
 
@@ -212,7 +350,7 @@ function createComputation<Next, Init = unknown>(
   const comp: Computation<Init | Next, Next> = {
     fn,
     state,
-    updatedAt: null,
+    updatedAt: null /** Last execution timestamp _(for glitch prevention)_ */,
     owned: null /** Will own child computations */,
     sources: null /** Will track dependencies */,
     sourceSlots: null /** Positions in dependencies of sources */,
@@ -325,18 +463,18 @@ export function runComputation(
     CURRENT_LISTENER = prevListener;
   }
 
-  /*
-	// TODO:
+  // Update if not already updated this cycle
   if (!node.updatedAt || node.updatedAt <= time) {
     if (node.updatedAt != null && "observers" in node) {
       writeSignal(node as Memo<any>, nextValue, true);
-    } else if (Transition && Transition.running && node.pure) {
-      Transition.sources.add(node as Memo<any>);
-      (node as Memo<any>).tValue = nextValue;
-    } else node.value = nextValue;
+    }
+    //  else if (Transition && Transition.running && node.pure) {
+    //   Transition.sources.add(node as Memo<any>);
+    //   (node as Memo<any>).tValue = nextValue;
+    // }
+    else node.value = nextValue;
     node.updatedAt = time;
   }
-	*/
 
   // Update value if needed
   node.value = nextValue;
@@ -489,7 +627,6 @@ function updateComputation(node: Computation<any>): void {
    * Otherwise, old children would linger and cause memory leaks!
    */
   cleanNode(node);
-
   const time = ExecCount;
   runComputation(node, node.value, time);
 }
@@ -501,6 +638,23 @@ function updateComputation(node: Computation<any>): void {
  */
 
 export function readSignal<T>(this: SignalState<T>): T {
+  // If this is a memo, check if it needs updating
+  if ((this as Memo<any>).sources && (this as Memo<any>).state !== CLEAN) {
+    const memo = this as Memo<any>;
+
+    if (memo.state === STALE) {
+      // Fully recompute
+      updateComputation(memo);
+    } else if (memo.state === PENDING) {
+      // Check upstream first
+      const prevUpdates = Updates;
+      Updates = null;
+      runUpdates(() => lookUpstream(memo), false);
+      Updates = prevUpdates;
+    }
+  }
+
+  // Track dependency
   if (CURRENT_LISTENER) {
     /**
      * Push the signal to the listener _(who will subscribe to the signal)_
@@ -560,6 +714,76 @@ export function readSignal<T>(this: SignalState<T>): T {
   }
 
   return this.value;
+}
+
+/**
+ * Updates a computation, checking upstream first
+ * Ensures topological order (dependencies before dependents)
+ */
+function runTop(node: Computation<any>): void {
+  // Already clean?
+  if (node.state === CLEAN) return;
+
+  // Still pending? Look upstream
+  // biome-ignore lint/correctness/noVoidTypeReturn: <explanation>
+  if (node.state === PENDING) return lookUpstream(node);
+
+  // Collect ancestors that need updating
+  const ancestors = [node];
+  while (
+    //
+    (node = node.owner as Computation<any>) &&
+    //
+    (!node.updatedAt || node.updatedAt < ExecCount)
+  ) {
+    if (node.state !== CLEAN) ancestors.push(node);
+  }
+
+  // Update from top down (parents before children)
+  for (let i = 0; i < ancestors.length; i++) {
+    node = ancestors[i]!;
+
+    if (node.state === STALE) {
+      updateComputation(node);
+    } else if (node.state === PENDING) {
+      const prevUpdates = Updates;
+      Updates = null;
+      runUpdates(() => lookUpstream(node), false);
+      Updates = prevUpdates;
+    }
+  }
+}
+
+/**
+ * Recursively updates upstream dependencies
+ * Used when a computation is PENDING
+ */
+function lookUpstream(node: Computation<any>, ignore?: Computation<any>): void {
+  /** Clear pending state */
+  node.state = CLEAN;
+
+  /** Check each source */
+  for (let i = 0; i < node.sources!.length; i++) {
+    const source = node.sources![i] as Memo<any>;
+
+    /** Only check memos (signals are always current) */
+    if (!source.sources) continue;
+    const state = source.state;
+
+    if (state === STALE) {
+      /** Source needs updating and we haven't updated it yet */
+      if (
+        source !== ignore &&
+        (!source.updatedAt || source.updatedAt < ExecCount)
+      ) {
+        /** Run with Topological Ordering */
+        runTop(source);
+      }
+    } else if (state === PENDING) {
+      /** Source is pending, recurse */
+      lookUpstream(source, ignore);
+    }
+  }
 }
 
 export function writeSignal<T>(node: SignalState<T>, value: T) {
@@ -660,7 +884,7 @@ export function writeSignal<T>(node: SignalState<T>, value: T) {
           const obs = node.observers![i]!;
 
           // Mark as stale
-          if (obs.state === FRESH) {
+          if (obs.state === CLEAN) {
             if (obs.pure) Updates!.push(obs); // Memo: add to Updates
             else Effects!.push(obs); // Effect: add to Effect
 
@@ -686,7 +910,7 @@ function markDownstream(node: Memo<any>): void {
   for (let i = 0; i < node.observers!.length; i++) {
     const obs = node.observers![i]!;
 
-    if (obs.state === FRESH) {
+    if (obs.state === CLEAN) {
       obs.state = PENDING; // Mark as pending (not stale yet)
       if (obs.pure) Updates!.push(obs); // Memo: add to Updates
       else Effects!.push(obs); // Effect: add to Effect

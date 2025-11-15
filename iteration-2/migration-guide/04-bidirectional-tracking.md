@@ -466,6 +466,127 @@ test("complex graph", () => {
 });
 ```
 
+## 🔄 Step 3: Implement runUpdates (Critical Missing Piece!)
+
+**This is the function that actually triggers the flush!**
+
+```typescript
+/**
+ * Core update cycle that manages queue creation and flushing
+ * This is what makes batching and proper execution order work!
+ */
+function runUpdates<T>(fn: () => T, init: boolean): T {
+  // If we're already flushing, just run the function
+  if (Updates) {
+    return fn();
+  }
+  
+  // Initialize the queues
+  Updates = [];
+  Effects = [];
+  ExecCount++;  // Increment for topological ordering
+  
+  try {
+    // Run the marking function (this adds computations to queues)
+    const result = fn();
+    
+    // Flush Updates queue (memos first!)
+    for (let i = 0; i < Updates.length; i++) {
+      const node = Updates[i]!;
+      if (node.state === STALE) {
+        updateComputation(node);
+      }
+    }
+    
+    // Flush Effects queue (side effects second!)
+    if (init) {
+      for (let i = 0; i < Effects.length; i++) {
+        const node = Effects[i]!;
+        if (node.state === STALE) {
+          updateComputation(node);
+        }
+      }
+    }
+    
+    return result;
+  } finally {
+    // Clean up queues
+    Updates = null;
+    if (init) Effects = null;
+  }
+}
+```
+
+### When runUpdates Gets Called
+
+```typescript
+// From writeSignal
+export function writeSignal<T>(node: SignalState<T>, value: T) {
+  if (!(node.comparator ?? defaultComparator)(node.value, value)) {
+    node.value = value;
+    
+    if (node.observers?.length) {
+      // ← THIS IS WHERE THE MAGIC HAPPENS!
+      runUpdates(() => {
+        // Mark all observers as STALE
+        for (let i = 0; i < node.observers!.length; i++) {
+          const obs = node.observers![i]!;
+          if (obs.state === CLEAN) {
+            obs.state = STALE;
+            if (obs.pure) Updates!.push(obs);
+            else Effects!.push(obs);
+          }
+        }
+      }, true);  // ← init=true means flush effects immediately
+    }
+  }
+  return node.value;
+}
+```
+
+### The Execution Flow
+
+```
+User Code:                   runUpdates:                    Results:
+─────────────────────────────────────────────────────────────────────
+setA(5);                →    Updates = []                   
+                             Effects = []
+                             ExecCount++
+                             
+                        →    fn() executes:
+                             - mark sum as STALE
+                             - add sum to Updates
+                             - mark effect as STALE  
+                             - add effect to Effects
+                             
+                        →    Flush Updates:
+                             - run sum()
+                             - sum.state = CLEAN
+                             
+                        →    Flush Effects:
+                             - run effect()
+                             - effect.state = CLEAN
+                             
+                        →    Updates = null         →    Done! ✅
+                             Effects = null
+```
+
+### Why This Matters
+
+**Without runUpdates implemented:**
+```javascript
+setA(5);  // Marks STALE but never flushes!
+setB(10); // Marks STALE but never flushes!
+// Effects sit in queue forever, never execute! ❌
+```
+
+**With runUpdates:**
+```javascript
+setA(5);  // Marks STALE → flushes Updates → flushes Effects ✅
+setB(10); // Marks STALE → flushes Updates → flushes Effects ✅
+// Everything executes properly! 🎉
+```
+
 ## 🚀 Next Step
 
 Continue to **[05-computation-states.md](./05-computation-states.md)** to implement the state machine for lazy evaluation.
