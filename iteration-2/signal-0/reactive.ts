@@ -879,7 +879,9 @@ export function writeSignal<T>(node: SignalState<T>, value: T) {
      */
     // Notify all observers
     if (node.observers?.length) {
+      // ← THIS IS WHERE THE MAGIC HAPPENS!!! ✨
       runUpdates(() => {
+        // Mark all observers as STALE
         for (let i = 0; i < node.observers!.length; i++) {
           const obs = node.observers![i]!;
 
@@ -895,7 +897,8 @@ export function writeSignal<T>(node: SignalState<T>, value: T) {
           }
           obs.state = STALE;
         }
-      }, false);
+      }, true);
+      // ← init=true means flush effects immediately
     }
   }
 
@@ -924,10 +927,42 @@ function markDownstream(node: Memo<any>): void {
 }
 
 /**
- * Core update cycle
+ * Core update cycle that manages queue creation and flushing
+ * This is what makes batching and proper execution order work!
  * Sets up queues, runs function, then completes updates
  */
 function runUpdates(fn: () => void, init: boolean) {
-  // TODO: to be implemented in later iterations
-  return fn();
+  // If we're already flushing, just run the function
+  if (Updates) {
+    return fn();
+  }
+
+  // Initialize the queues
+  Updates = [];
+  Effects = [];
+  ExecCount++; // Increment for topological ordering
+  try {
+    // Run the marking function (this adds computations to queues)
+    const result = fn();
+
+    // Flush Updates queue (memos first!)
+    for (let i = 0; i < Updates.length; i++) {
+      const node = Updates[i];
+      if (node?.state === STALE) updateComputation(node);
+    }
+
+    // Flush Effects queue (side effects second!)
+    if (init) {
+      for (let i = 0; i < Effects.length; i++) {
+        const node = Effects[i];
+        if (node?.state === STALE) updateComputation(node);
+      }
+    }
+
+    return result;
+  } finally {
+    // Clean up queues
+    Updates = null;
+    if (init) Effects = null;
+  }
 }
