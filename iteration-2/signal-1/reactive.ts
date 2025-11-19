@@ -142,6 +142,263 @@ import type {
  * // Guaranteed: parents before children
  * // D always sees consistent B and C values
  * ```
+ *
+ * ### How It All Works Together
+ *
+ * ```typescript
+ * // Complete flow with states:
+ * const [a, setA] = createSignal(1);
+ * const [b, setB] = createSignal(2);
+ *
+ * const sum = createMemo(() => a() + b());
+ * const doubled = createMemo(() => sum() * 2);
+ *
+ * createEffect(() => {
+ *   console.log(doubled());
+ * });
+ *
+ * // Initial: all CLEAN
+ * // sum.state = 0
+ * // doubled.state = 0
+ * // effect.state = 0
+ *
+ * setA(5);  // Triggers writeSignal
+ *
+ * // ┌─ writeSignal ────────────────────────────────────┐
+ * // │ 1. a.value = 5                                   │
+ * // │ 2. runUpdates(() => { ... }, true)               │
+ * // └──────────────────────────────────────────────────┘
+ * //
+ * // ┌─ runUpdates Phase 1: Initialize ─────────────────┐
+ * // │ Updates = []                                     │
+ * // │ Effects = []                                     │
+ * // │ ExecCount++ (now = 1)                            │
+ * // └──────────────────────────────────────────────────┘
+ * //
+ * // ┌─ runUpdates Phase 2: Mark ───────────────────────┐
+ * // │ fn() executes:                                   │
+ * // │   sum.state = STALE                              │
+ * // │   Updates.push(sum)                              │
+ * // │   markDownstream(sum):                           │
+ * // │     doubled.state = PENDING                      │
+ * // │     Updates.push(doubled)                        │
+ * // │     markDownstream(doubled):                     │
+ * // │       effect.state = PENDING                     │
+ * // │       Effects.push(effect)                       │
+ * // └──────────────────────────────────────────────────┘
+ * //
+ * // ┌─ runUpdates Phase 3: Flush Updates ──────────────┐
+ * // │ for (sum in Updates):                            │
+ * // │   runTop(sum):                                   │
+ * // │     sum.state === STALE                          │
+ * // │     updateComputation(sum)                       │
+ * // │     sum.value = 7                                │
+ * // │     sum.state = CLEAN                            │
+ * // │     sum.updatedAt = 1                            │
+ * // │                                                  │
+ * // │ for (doubled in Updates):                        │
+ * // │   runTop(doubled):                               │
+ * // │     doubled.state === PENDING                    │
+ * // │     lookUpstream(doubled):                       │
+ * // │       check sum: state=CLEAN, updatedAt=1 ✓      │
+ * // │     updateComputation(doubled)                   │
+ * // │     doubled.value = 14                           │
+ * // │     doubled.state = CLEAN                        │
+ * // └──────────────────────────────────────────────────┘
+ * //
+ * // ┌─ runUpdates Phase 4: Flush Effects ──────────────┐
+ * // │ for (effect in Effects):                         │
+ * // │   runTop(effect):                                │
+ * // │     effect.state === PENDING                     │
+ * // │     lookUpstream(effect):                        │
+ * // │       check doubled: state=CLEAN ✓               │
+ * // │     updateComputation(effect)                    │
+ * // │     console.log(14)  ← Side effect!              │
+ * // │     effect.state = CLEAN                         │
+ * // └──────────────────────────────────────────────────┘
+ * //
+ * // ┌─ runUpdates Phase 5: Cleanup ────────────────────┐
+ * // │ Updates = null                                   │
+ * // │ Effects = null                                   │
+ * // └──────────────────────────────────────────────────┘
+ * //
+ * // Final: all CLEAN again, consistent values! ✨
+ * ```
+ *
+ * ### Why This Achieves All Six Goals
+ *
+ * 1. **Lazy Evaluation** ✅
+ *    - Computations marked STALE but only update during flush
+ *    - If never accessed, never computed
+ *
+ * 2. **State Machine** ✅
+ *    - CLEAN → STALE → PENDING → CLEAN cycle
+ *    - Clear lifecycle management
+ *
+ * 3. **Glitch Prevention** ✅
+ *    - ExecCount timestamp ensures we see updates once
+ *    - lookUpstream checks prevent reading stale values
+ *
+ * 4. **Topological Ordering** ✅
+ *    - runTop walks up owner chain
+ *    - Updates parents before children
+ *
+ * 5. **Performance** ✅
+ *    - Batch updates in runUpdates
+ *    - Process once per cycle, not per signal change
+ *
+ * 6. **Correctness** ✅
+ *    - PENDING state ensures upstream consistency
+ *    - Only see final, stable values
+ *
+ * ## 🔑 Critical Difference: Memos vs Effects
+ *
+ * Now that you understand lazy evaluation, it's crucial to understand how memos differ from effects:
+ *
+ * ### Memos: Lazy (Pull-based)
+ *
+ * ```typescript
+ * const [count, setCount] = createSignal(0);
+ *
+ * const doubled = createMemo(() => {
+ *   console.log("Computing doubled");
+ *   return count() * 2;
+ * });
+ *
+ * setCount(5);  // Memo marked STALE, NOT computed yet!
+ * console.log("Between updates");
+ * doubled();    // NOW it computes!
+ * console.log("After access");
+ *
+ * // Output:
+ * // Between updates
+ * // Computing doubled  ← Happens on access!
+ * // After access
+ * ```
+ *
+ * **Trigger:** Access (reading the value)
+ * **Timing:** On-demand, when read
+ * **Purpose:** Cached derived values
+ * **Optimization:** Never accessed = never computed
+ *
+ * ### Effects: Eager (Push-based)
+ *
+ * ```typescript
+ * const [count, setCount] = createSignal(0);
+ *
+ * createEffect(() => {
+ *   console.log("Effect sees:", count());
+ * });
+ *
+ * setCount(5);  // Effect flushes IMMEDIATELY!
+ * // ↑ Effect already ran (synchronously)
+ * console.log("After update");
+ *
+ * // Output:
+ * // Effect sees: 0  ← Initial run
+ * // Effect sees: 5  ← Ran synchronously in setCount!
+ * // After update
+ * ```
+ *
+ * **Trigger:** Signal update
+ * **Timing:** Synchronous flush
+ * **Purpose:** Side effects
+ * **Guarantee:** Always runs (can't skip)
+ *
+ * ### Why This Matters
+ *
+ * ```typescript
+ * const [count, setCount] = createSignal(0);
+ *
+ * // Memo: Only computes if accessed
+ * const expensive = createMemo(() => {
+ *   console.log("Expensive computation");
+ *   let result = 0;
+ *   for (let i = 0; i < 1000000; i++) {
+ *     result += Math.sqrt(i);
+ *   }
+ *   return result;
+ * });
+ *
+ * setCount(1);  // NOT computed yet!
+ * setCount(2);  // Still not computed!
+ * setCount(3);  // Still not computed!
+ * console.log("Memos not computed yet!");
+ *
+ * expensive();  // NOW it computes ONCE with final value!
+ *
+ * // VS
+ *
+ * // Effect: Always runs on change
+ * createEffect(() => {
+ *   console.log("Effect runs");
+ *   let result = 0;
+ *   for (let i = 0; i < 1000000; i++) {
+ *     result += Math.sqrt(i);
+ *   }
+ *   return result;
+ * });
+ *
+ * setCount(1);  // Runs immediately! (expensive!)
+ * setCount(2);  // Runs again! (expensive!)
+ * setCount(3);  // Runs again! (expensive!)
+ * // 3 expensive computations!
+ * ```
+ *
+ * ### Performance Comparison
+ *
+ * | Scenario | Memo | Effect |
+ * |----------|------|--------|
+ * | Signal updated | Marked STALE | Runs immediately |
+ * | Multiple updates | Marks STALE each time | Runs each time |
+ * | Never accessed | Never computes ✅ | Always runs ❌ |
+ * | Accessed once | Computes once ✅ | N/A |
+ * | Accessed multiple times | Returns cached ✅ | N/A |
+ * | **Best for** | Derived values | Side effects |
+ *
+ * ### Use Cases
+ *
+ * **Use Memos When:**
+ * ```typescript
+ * // Deriving values
+ * const fullName = createMemo(() => `${first()} ${last()}`);
+ *
+ * // Expensive computations
+ * const filtered = createMemo(() => items().filter(predicate));
+ *
+ * // Complex calculations
+ * const stats = createMemo(() => calculateStatistics(data()));
+ * ```
+ *
+ * **Use Effects When:**
+ * ```typescript
+ * // DOM updates
+ * createEffect(() => {
+ *   element.textContent = message();
+ * });
+ *
+ * // Logging/debugging
+ * createEffect(() => {
+ *   console.log("State changed:", state());
+ * });
+ *
+ * // External sync
+ * createEffect(() => {
+ *   saveToLocalStorage(data());
+ * });
+ * ```
+ *
+ * ### Key Insight
+ *
+ * **Memos are performance optimizations** (lazy, cached)
+ * **Effects are for side effects** (eager, always run)
+ *
+ * Choose based on your needs:
+ * - Need a derived value? → Memo
+ * - Need a side effect? → Effect
+ * - Want to skip computation? → Memo (it might not run!)
+ * - Must always execute? → Effect (it will always run!)
+ *
  */
 
 /*
@@ -749,41 +1006,117 @@ export function readSignal<T>(this: SignalState<T>): T {
 }
 
 /**
- * Updates a computation, checking upstream first
- * Ensures topological order (dependencies before dependents)
+ * Updates a computation with TOPOLOGICAL ORDERING
+ *
+ * Topological ordering means: **Parents update before children**
+ * This prevents glitches by ensuring consistent values.
+ *
+ * How it works:
+ * 1. Start with the computation that needs updating (e.g., quadrupled)
+ * 2. Walk UP the ownership chain collecting stale ancestors (e.g., doubled, sum)
+ * 3. Process in REVERSE order = parents first (sum → doubled → quadrupled)
+ *
+ * Example:
+ * ```
+ * signal
+ *   ↓
+ * sum (owner of doubled)        ← Level 1 (grandparent)
+ *   ↓
+ * doubled (owner of quadrupled) ← Level 2 (parent)
+ *   ↓
+ * quadrupled                    ← Level 3 (child)
+ * ```
+ *
+ * When quadrupled needs updating:
+ * - ancestors = [quadrupled, doubled, sum]  ← Collected bottom-up
+ * - Process: sum → doubled → quadrupled     ← Execute top-down (reversed)
+ *
+ * @param node - The computation that was accessed/needs updating
  */
 function runTop(node: Computation<any>): void {
-  // Already clean?
+  // Fast path: Already up-to-date?
   if (node.state === CLEAN) return;
 
-  // Still pending? Look upstream
+  // If pending, just check upstream and return
   // biome-ignore lint/correctness/noVoidTypeReturn: <explanation>
   if (node.state === PENDING) return lookUpstream(node);
 
-  // Collect ancestors that need updating
-  const ancestors = [node];
+  /**
+   * PHASE 1: COLLECT ANCESTORS (Walk UP the chain)
+   * ===============================================
+   * We start with the current node and walk up the ownership chain,
+   * collecting any ancestors that are stale (outdated).
+   *
+   * Think of it like climbing a family tree to find who needs updating.
+   */
+  const ancestors = [node]; // Start with current node (e.g., [quadrupled])
+
+  /**
+   * Walk up the ownership chain:
+   * - node.owner = parent computation that owns this one
+   * - Keep going until we hit the root or find a current ancestor
+   *
+   * Example walk:
+   * 1. node = quadrupled (updatedAt = 0, ExecCount = 1) → 0 < 1 ✓ stale
+   * 2. node = doubled (updatedAt = 0, ExecCount = 1) → 0 < 1 ✓ stale
+   * 3. node = sum (updatedAt = 1, ExecCount = 1) → 1 < 1 ✗ current, STOP
+   *
+   * Result: ancestors = [quadrupled, doubled, sum]
+   */
   while (
-    //
-    (node = node.owner as Computation<any>) &&
-    //
-    (!node.updatedAt || node.updatedAt < ExecCount)
+    (node = node.owner as Computation<any>) && // Move to parent
+    (!node.updatedAt || node.updatedAt < ExecCount) // Is parent outdated?
   ) {
+    // Only add if it needs updating (not CLEAN)
     if (node.state !== CLEAN) ancestors.push(node);
   }
 
-  // Update from top down (parents before children)
-  for (let i = 0; i < ancestors.length; i++) {
+  /**
+   * Now ancestors contains (bottom-up):
+   * [child, parent, grandparent, ...]
+   * Example: [quadrupled, doubled, sum]
+   */
+
+  /**
+   * PHASE 2: UPDATE TOP-DOWN (Process in order)
+   * ============================================
+   * We collected children first (bottom-up), but now we process
+   * parents first (top-down) to ensure consistency.
+   *
+   * Why? If we updated quadrupled first, it would read stale doubled!
+   * By updating sum → doubled → quadrupled, each sees consistent parents.
+   */
+  for (let i = ancestors.length - 1; i >= 0; i--) {
+    /**
+     * Process in REVERSE order (top-down):
+     * i = 2: sum        ← Grandparent first
+     * i = 1: doubled    ← Parent second
+     * i = 0: quadrupled ← Child last
+     *
+     * This guarantees: Parents are always CLEAN when children read them!
+     */
     node = ancestors[i]!;
 
     if (node.state === STALE) {
+      // Fully outdated - recompute now
       updateComputation(node);
     } else if (node.state === PENDING) {
+      // Waiting for dependencies - check them first
       const prevUpdates = Updates;
       Updates = null;
       runUpdates(() => lookUpstream(node), false);
       Updates = prevUpdates;
     }
   }
+
+  /**
+   * Result: All ancestors are now CLEAN and consistent!
+   * ✅ sum.value = 15
+   * ✅ doubled.value = 30 (uses fresh sum)
+   * ✅ quadrupled.value = 60 (uses fresh doubled)
+   *
+   * No glitches - all values are consistent! 🎉
+   */
 }
 
 /**
