@@ -983,11 +983,38 @@ function writeSignal(signal, newValue) {
       if (observer.pure) Updates.push(observer);
       else Effects.push(observer);
     }
-  }, true);
+  }, false);  // ← false (explained below)
 }
 ```
 
-### The Complete Flow
+### ⚠️ IMPORTANT: Understanding Batching
+
+**Common Mistake:** Thinking `false` means "automatic batching"
+
+**Reality:** Effects run after EVERY signal update!
+
+```javascript
+// WITHOUT batch() - Effects run multiple times:
+setA(5);
+// ↓ Runs immediately (synchronous):
+// - Marks STALE
+// - Flushes Updates (memos)
+// - Flushes Effects (effects run!)
+// - Clears queues
+// - Returns
+
+setB(10);
+// ↓ Runs immediately AGAIN:
+// - Marks STALE
+// - Flushes Updates (memos)
+// - Flushes Effects (effects run AGAIN!)
+// - Clears queues
+// - Returns
+
+// Result: Effect ran TWICE! 😱
+```
+
+### The Complete Flow (One Signal Update)
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -997,7 +1024,7 @@ function writeSignal(signal, newValue) {
 ┌─────────────────────────────────────────────────────────┐
 │ writeSignal runs:                                       │
 │ 1. count.value = 5                                      │
-│ 2. Call runUpdates(...)                                 │
+│ 2. Call runUpdates(...) ← All happens NOW!              │
 └─────────────────────┬───────────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────────┐
@@ -1017,65 +1044,76 @@ function writeSignal(signal, newValue) {
                       ↓
 ┌─────────────────────────────────────────────────────────┐
 │ runUpdates Phase 3: Flush Updates                       │
-│ - Run memo.fn()                                         │
+│ - Run memo.fn() ← Happens immediately!                  │
 │ - memo.state = CLEAN                                    │
 │ - memo.value = 10                                       │
 └─────────────────────┬───────────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────────┐
 │ runUpdates Phase 4: Flush Effects                       │
-│ - Run effect.fn()                                       │
+│ - Run effect.fn() ← Happens immediately!                │
 │ - effect.state = CLEAN                                  │
-│ - console.log(10) ← Side effect happens!                │
+│ - console.log(10) ← Side effect happens NOW!            │
 └─────────────────────┬───────────────────────────────────┘
                       ↓
 ┌─────────────────────────────────────────────────────────┐
 │ runUpdates Phase 5: Cleanup                             │
-│ - Updates = null                                        │
-│ - Effects = null                                        │
+│ - Updates = null ← Cleared!                             │
+│ - Effects = null ← Cleared!                             │
 └─────────────────────┬───────────────────────────────────┘
                       ↓
-                   Done! ✨
+         Done! Returns to caller ✨
+         (All happened synchronously!)
 ```
 
-### Why You Need This
+### To Actually Batch Multiple Updates:
 
-**Without runUpdates:**
 ```javascript
-setA(5);   // Marks STALE... but nothing happens! ❌
-setB(10);  // Marks STALE... but nothing happens! ❌
-// Effects sit in queue forever!
-```
-
-**With runUpdates:**
-```javascript
-setA(5);   // Marks STALE → Flushes → Effects run! ✅
-setB(10);  // Marks STALE → Flushes → Effects run! ✅
-// Everything executes properly!
+// Use batch() explicitly:
+batch(() => {
+  setA(5);   // Just marks (no flush)
+  setB(10);  // Just marks (no flush)
+});
+// NOW flush happens ONCE! ✅
 ```
 
 ### Think of It Like a Restaurant Kitchen 🍳
 
+**WITHOUT batch():**
 ```
-📝 Order comes in (setSignal called)
-     ↓
-📋 Add to cooking queue (mark STALE)
-     ↓
-🔥 Flush queue: Cook all meals (runUpdates)
-     ↓
-🍽️ Serve to customers (effects execute)
+📝 Order A comes in → 🔥 Cook → 🍽️ Serve → Done
+📝 Order B comes in → 🔥 Cook → 🍽️ Serve → Done
+                        ↑
+              Two separate cooking sessions!
+```
+
+**WITH batch():**
+```
+📝 Order A comes in → 📋 Hold
+📝 Order B comes in → 📋 Hold
+  (End of batch) → 🔥 Cook both → 🍽️ Serve both → Done
+                        ↑
+              One cooking session for both!
 ```
 
 **runUpdates is the chef** that:
-1. Collects all orders (marks STALE)
-2. Cooks them in the right order (Updates then Effects)
-3. Serves them all at once (flush)
+1. Takes the order (marks STALE)
+2. Cooks immediately (flushes)
+3. Serves immediately (effects execute)
+4. Cleans up (clears queues)
+
+**batch() is the waiter** that:
+1. Collects multiple orders
+2. Sends them all to chef at once
+3. Chef cooks once for all orders
 
 ## 🚀 Next Steps
 
-Now that you understand bidirectional tracking AND when flushes happen, you're ready to learn about:
+**MUST READ:** 
+- **[04.5-the-truth-about-batching.md](./04.5-the-truth-about-batching.md)** - Learn when to use `batch()`
+- **[04.6-synchronous-execution-model.md](./04.6-synchronous-execution-model.md)** - Understand timing
 
-**[05-computation-states.md](./05-computation-states.md)** - How to implement lazy evaluation with state machines!
+Then continue to **[05-computation-states.md](./05-computation-states.md)** to learn about lazy evaluation with state machines!
 
 ---
 

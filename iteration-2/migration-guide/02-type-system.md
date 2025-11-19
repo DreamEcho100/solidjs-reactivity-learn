@@ -540,18 +540,363 @@ items().forEach(item => {
 });
 ```
 
+## 🔧 TypeScript Configuration
+
+### Recommended tsconfig.json
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "lib": ["ES2020", "DOM"],
+    "moduleResolution": "node",
+    
+    // Strict type checking
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "strictFunctionTypes": true,
+    "strictBindCallApply": true,
+    "strictPropertyInitialization": true,
+    "noImplicitThis": true,
+    "alwaysStrict": true,
+    
+    // Additional checks
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    
+    // Output
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "outDir": "./dist",
+    
+    // Module resolution
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    
+    // Advanced
+    "skipLibCheck": true
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist", "**/*.test.ts"]
+}
+```
+
+## 🎨 Advanced Type Patterns
+
+### Pattern 1: Conditional Return Types
+
+```typescript
+/**
+ * createSignal can accept undefined initial value
+ * Return type adjusts based on whether value is provided
+ */
+export function createSignal<T>(): Signal<T | undefined>;
+export function createSignal<T>(value: T, options?: SignalOptions<T>): Signal<T>;
+export function createSignal<T>(
+  value?: T,
+  options?: SignalOptions<T>
+): Signal<T | undefined> {
+  // Implementation
+}
+
+// Usage:
+const [name, setName] = createSignal<string>(); 
+// name: Accessor<string | undefined> ✅
+
+const [count, setCount] = createSignal(0);
+// count: Accessor<number> ✅
+```
+
+### Pattern 2: Type Guards
+
+```typescript
+/**
+ * Type guard to check if a node is a Computation
+ */
+export function isComputation(node: Owner): node is Computation<any> {
+  return 'fn' in node && 'state' in node;
+}
+
+// Usage:
+function processNode(node: Owner) {
+  if (isComputation(node)) {
+    // TypeScript knows node is Computation here
+    console.log(node.state); // ✅ OK
+  }
+}
+```
+
+### Pattern 3: Mapped Types
+
+```typescript
+/**
+ * Make all signals in an object reactive
+ */
+export type ReactiveObject<T> = {
+  [K in keyof T]: Signal<T[K]>;
+};
+
+// Usage:
+interface User {
+  name: string;
+  age: number;
+}
+
+const reactiveUser: ReactiveObject<User> = {
+  name: createSignal("John"),
+  age: createSignal(30)
+};
+```
+
+### Pattern 4: Generic Constraints
+
+```typescript
+/**
+ * Effect that works with readonly arrays
+ */
+export function createArrayEffect<T extends readonly any[]>(
+  fn: (prev: T) => T,
+  init: T
+): void {
+  // Implementation
+}
+
+// Usage:
+createArrayEffect(
+  prev => [...prev, 1],
+  [1, 2, 3] as const // Readonly array ✅
+);
+```
+
+## 🔍 Type Inference Examples
+
+### Example 1: Complex Generic Inference
+
+```typescript
+// Solid.js can infer complex nested types
+const [user, setUser] = createSignal({
+  name: "John",
+  age: 30,
+  friends: ["Alice", "Bob"]
+});
+
+// Inferred type:
+// Accessor<{
+//   name: string;
+//   age: number;
+//   friends: string[];
+// }>
+
+setUser(prev => ({
+  ...prev,
+  age: prev.age + 1 // ✅ Knows age is number
+}));
+
+setUser({ name: "Jane", age: "25", friends: [] }); 
+// ❌ Error: age must be number
+```
+
+### Example 2: Discriminated Unions
+
+```typescript
+type State = 
+  | { status: "idle" }
+  | { status: "loading" }
+  | { status: "success"; data: string }
+  | { status: "error"; error: Error };
+
+const [state, setState] = createSignal<State>({ status: "idle" });
+
+createEffect(() => {
+  const s = state();
+  
+  if (s.status === "success") {
+    console.log(s.data); // ✅ TypeScript knows data exists
+  }
+  
+  if (s.status === "idle") {
+    console.log(s.data); // ❌ Error: data doesn't exist on idle
+  }
+});
+```
+
+### Example 3: Function Overloads
+
+```typescript
+// Setter handles both direct values and updater functions
+const [count, setCount] = createSignal(0);
+
+setCount(5); // ✅ Direct value
+setCount(n => n + 1); // ✅ Updater function
+setCount(() => 5); // ✅ Also works (but why? 😄)
+
+const [items, setItems] = createSignal<number[]>([]);
+setItems([1, 2, 3]); // ✅ Direct value
+setItems(prev => [...prev, 4]); // ✅ Updater function
+```
+
+## 🛡️ Runtime Type Safety
+
+### Adding Runtime Checks
+
+```typescript
+/**
+ * Create signal with runtime type validation
+ */
+export function createTypedSignal<T>(
+  value: T,
+  validator: (value: unknown) => value is T,
+  options?: SignalOptions<T>
+): Signal<T> {
+  const [get, set] = createSignal(value, options);
+  
+  return [
+    get,
+    (nextValue) => {
+      const val = typeof nextValue === 'function'
+        ? nextValue(get())
+        : nextValue;
+        
+      if (!validator(val)) {
+        throw new TypeError(`Invalid value: ${val}`);
+      }
+      
+      return set(val);
+    }
+  ];
+}
+
+// Usage:
+const isNumber = (val: unknown): val is number => typeof val === 'number';
+const [count, setCount] = createTypedSignal(0, isNumber);
+
+setCount(5); // ✅ OK
+setCount("5" as any); // ❌ Throws TypeError at runtime!
+```
+
+## 📊 Type Complexity Analysis
+
+### Simple Types (Low Complexity)
+```typescript
+type Accessor<T> = () => T;
+// ✅ Easy to understand
+// ✅ Fast compilation
+// ✅ Clear errors
+```
+
+### Medium Types (Moderate Complexity)
+```typescript
+type Setter<T> = {
+  <U extends T>(value: (prev: T) => U): U;
+  <U extends T>(value: Exclude<U, Function>): U;
+};
+// ⚠️ Multiple overloads
+// ⚠️ Generic constraints
+// ✅ Still manageable
+```
+
+### Complex Types (High Complexity)
+```typescript
+interface Computation<Init, Next extends Init = Init> extends Owner {
+  fn: EffectFunction<Init, Next>;
+  // ...
+}
+// ⚠️ Multiple generics
+// ⚠️ Generic constraints
+// ⚠️ Interface extension
+// ⚠️ Slower compilation
+// Use only when necessary!
+```
+
+## 🎓 Learning Path for Types
+
+### Week 1: Basic Types
+- [ ] Learn `Accessor<T>` and `Setter<T>`
+- [ ] Understand `Signal<T>` tuple type
+- [ ] Practice with `SignalOptions<T>`
+- [ ] Write simple typed signals
+
+### Week 2: Intermediate Types
+- [ ] Study `Owner` and `Computation` interfaces
+- [ ] Understand bidirectional tracking types
+- [ ] Learn `ComputationState` enum
+- [ ] Implement typed effects
+
+### Week 3: Advanced Types
+- [ ] Master `TransitionState` interface
+- [ ] Understand `Memo<Prev, Next>` type
+- [ ] Learn generic constraints
+- [ ] Use conditional types
+
+### Week 4: Expert Types
+- [ ] Type guards and narrowing
+- [ ] Mapped types for utilities
+- [ ] Advanced generic patterns
+- [ ] Performance optimization
+
 ## 📝 Migration Checklist
 
+### Phase 1: Setup
 - [ ] Create `reactive-types.ts` with all type definitions
-- [ ] Update your signal implementation to use typed interfaces
-- [ ] Add generics to all function signatures
+- [ ] Configure `tsconfig.json` with strict mode
+- [ ] Install type dependencies (`@types/node`, etc.)
+- [ ] Set up linting with TypeScript rules
+
+### Phase 2: Core Types
+- [ ] Define `ComputationState`, `STALE`, `PENDING`
+- [ ] Create `Accessor<T>` and `Setter<T>` types
+- [ ] Implement `Signal<T>` tuple type
+- [ ] Add `SignalState<T>` interface
+
+### Phase 3: Advanced Types
+- [ ] Define `Owner` interface
+- [ ] Create `Computation<Init, Next>` interface
+- [ ] Add `Memo<Prev, Next>` type
+- [ ] Implement `TransitionState`
+
+### Phase 4: Options & Utilities
+- [ ] Add `SignalOptions<T>` interface
+- [ ] Create `EffectOptions` and `MemoOptions`
+- [ ] Define `RootFunction<T>` type
+- [ ] Add utility types (`NoInfer`, etc.)
+
+### Phase 5: Validation
 - [ ] Test type inference with various scenarios
-- [ ] Enable strict mode in tsconfig.json
+- [ ] Verify strict null checks work
+- [ ] Check error messages are clear
+- [ ] Ensure no `any` types escape
+- [ ] Run `tsc --noEmit` successfully
+
+## ✅ Self-Check Questions
+
+1. **Q:** Why does `Setter<T>` have multiple overloads?
+   **A:** To handle both direct values and updater functions correctly.
+
+2. **Q:** What's the difference between `Computation` and `Memo`?
+   **A:** Memo extends both Computation and SignalState, has required `value`.
+
+3. **Q:** When should you use `NoInfer<T>`?
+   **A:** To prevent unwanted type inference in generic function parameters.
+
+4. **Q:** Why is `ComputationState` a union of literals (0 | 1 | 2)?
+   **A:** More type-safe than enum, better for minification, explicit values.
+
+5. **Q:** How does `Owner` differ from `Computation`?
+   **A:** Owner is the base, Computation extends it with reactive tracking.
 
 ## 🚀 Next Step
 
-Continue to **[03-ownership-model.md](./03-ownership-model.md)** to implement the ownership hierarchy.
+Continue to **[03-ownership-model.md](./03-ownership-model.md)** to implement the ownership hierarchy using these types.
 
 ---
 
-**💡 Pro Tip**: Good types make your code self-documenting. If something feels complex to type, it might be complex to use!
+**💡 Pro Tip**: Good types make your code self-documenting. If something feels complex to type, it might be complex to use! Start simple, add complexity only when needed. Use type inference where possible, explicit types where clarity is important.

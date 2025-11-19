@@ -1,0 +1,836 @@
+# Step 6: Effect Scheduling & Multi-Queue System
+
+## 🎯 Goal
+Implement a proper scheduling system with separate queues for memos (Updates) and effects (Effects) to ensure correct execution order.
+
+## 🤔 The Problem: Mixed Execution
+
+### Your Current Implementation
+
+```javascript
+// Single Set for all effects
+currentBatchEffects = new Set();
+
+// All effects mixed together
+setSignalA(1); // Adds effectX, memoY
+setSignalB(2); // Adds effectZ, memoW
+
+// Execution order is undefined!
+for (const effect of currentBatchEffects) {
+  effect.execute(); // Could be memo or effect, random order
+}
+```
+
+**Problems:**
+1. Effects might run before memos finish computing
+2. Effects see inconsistent derived state
+3. No guarantee of stable reads
+
+### Example: The Inconsistency Problem
+
+```javascript
+const [first, setFirst] = createSignal("John");
+const [last, setLast] = createSignal("Doe");
+
+const fullName = createMemo(() => `${first()} ${last()}`);
+
+createEffect(() => {
+  // Might see "Jane Doe" if memo hasn't updated yet!
+  document.title = fullName();
+});
+
+batch(() => {
+  setFirst("Jane");
+  setLast("Smith");
+});
+
+// Without proper scheduling:
+// Effect might run before memo computes
+// Title could be "Jane Doe" (wrong!) or "Jane Smith" (correct) - race condition!
+```
+
+## 📊 Multi-Queue Architecture
+
+### Solid.js Approach
+
+```
+Signal Updates
+       ↓
+   ┌────────┐
+   │UPDATES │ ← Pure computations (memos)
+   │Queue   │   Priority: Compute derived values
+   └────────┘
+       ↓
+   All memos computed
+       ↓
+   ┌────────┐
+   │EFFECTS │ ← Side effects
+   │Queue   │   Priority: Run after stable values
+   └────────┘
+       ↓
+   Done!
+
+Guarantee: Effects ALWAYS see final memo values
+```
+
+### Queue Types
+
+```typescript
+/**
+ * Updates: Pure computations (memos, computed values)
+ * - Run first
+ * - Can have observers
+ * - Must finish before Effects
+ */
+let Updates: Computation<any>[] | null = null;
+
+/**
+ * Effects: Side effects (DOM updates, console.log, etc.)
+ * - Run second
+ * - Cannot have observers
+ * - See stable computed values
+ */
+let Effects: Computation<any>[] | null = null;
+```
+
+## 🏗️ Implementation
+
+### Step 1: Define Global Queues
+
+```typescript
+// reactive.ts
+
+/**
+ * Queue for pure computations (memos)
+ * Processed first to ensure derived values are up-to-date
+ */
+let Updates: Computation<any>[] | null = null;
+
+/**
+ * Queue for side effects
+ * Processed after Updates to see stable values
+ */
+let Effects: Computation<any>[] | null = null;
+
+/**
+ * Execution counter for topological ordering
+ */
+let ExecCount = 0;
+
+/**
+ * Current effect runner function
+ * Can be swapped to change effect execution behavior
+ */
+let runEffects = runQueue;
+```
+
+### Step 2: Separate Memos from Effects
+
+```typescript
+export function writeSignal(node: SignalState<any>, value: any): any {
+  if (!node.comparator || !node.comparator(node.value, value)) {
+    node.value = value;
+    
+    if (node.observers && node.observers.length) {
+      runUpdates(() => {
+        for (let i = 0; i < node.observers!.length; i += 1) {
+          const o = node.observers![i];
+          
+          if (!o.state) {
+            // ← KEY DIFFERENCE: Route to different queues
+            if (o.pure) {
+              Updates!.push(o);  // Memos go to Updates
+            } else {
+              Effects!.push(o);  // Effects go to Effects
+            }
+            
+            // Mark downstream
+            if ((o as Memo<any>).observers) {
+              markDownstream(o as Memo<any>);
+            }
+          }
+          
+          o.state = STALE;
+        }
+      }, false);
+    }
+  }
+  
+  return value;
+}
+```
+
+### Step 3: Process Queues in Order
+
+```typescript
+/**
+ * Core update cycle
+ * Sets up queues, runs function, then completes updates
+ */
+function runUpdates<T>(fn: () => T, init: boolean): T {
+  // Already in an update? Just run the function
+  if (Updates) return fn();
+  
+  let wait = false;
+  
+  // Initialize queues
+  if (!init) Updates = [];
+  if (Effects) wait = true;
+  else Effects = [];
+  
+  ExecCount++; // Increment for this update cycle
+  
+  try {
+    const res = fn();
+    completeUpdates(wait);
+    return res;
+  } catch (err) {
+    if (!wait) Effects = null;
+    Updates = null;
+    handleError(err);
+  }
+}
+
+/**
+ * Completes an update cycle by flushing both queues
+ */
+function completeUpdates(wait: boolean): void {
+  // 1. Process Updates (memos) first
+  if (Updates) {
+    runQueue(Updates);
+    Updates = null;
+  }
+  
+  if (wait) return;
+  
+  // 2. Process Effects second
+  const e = Effects!;
+  Effects = null;
+  
+  if (e.length) {
+    runUpdates(() => runEffects(e), false);
+  }
+}
+```
+
+### Step 4: Running Queues
+
+```typescript
+/**
+ * Processes a queue of computations
+ */
+function runQueue(queue: Computation<any>[]): void {
+  for (let i = 0; i < queue.length; i++) {
+    runTop(queue[i]);
+  }
+}
+
+/**
+ * Special runner for user effects (separate from render effects)
+ */
+function runUserEffects(queue: Computation<any>[]): void {
+  let i, userLength = 0;
+  
+  // Separate render effects from user effects
+  for (i = 0; i < queue.length; i++) {
+    const e = queue[i];
+    if (!e.user) {
+      runTop(e); // Run render effects immediately
+    } else {
+      queue[userLength++] = e; // Collect user effects
+    }
+  }
+  
+  // Run user effects after render effects
+  for (i = 0; i < userLength; i++) {
+    runTop(queue[i]);
+  }
+}
+```
+
+### Step 5: Effect Types
+
+```typescript
+/**
+ * Creates a computed effect (runs before render)
+ */
+export function createComputed<Next>(
+  fn: EffectFunction<undefined | NoInfer<Next>, Next>
+): void {
+  const c = createComputation(fn, undefined!, true, STALE);
+  updateComputation(c);
+}
+
+/**
+ * Creates a render effect (runs during render)
+ */
+export function createRenderEffect<Next>(
+  fn: EffectFunction<undefined | NoInfer<Next>, Next>
+): void {
+  const c = createComputation(fn, undefined!, false, STALE);
+  updateComputation(c);
+}
+
+/**
+ * Creates a user effect (runs after render)
+ */
+export function createEffect<Next>(
+  fn: EffectFunction<undefined | NoInfer<Next>, Next>
+): void {
+  runEffects = runUserEffects; // Switch to user effect runner
+  const c = createComputation(fn, undefined!, false, STALE);
+  c.user = true; // Mark as user effect
+  
+  if (Effects) {
+    Effects.push(c);
+  } else {
+    updateComputation(c);
+  }
+}
+```
+
+## 🎨 Execution Flow Example
+
+### Code
+
+```typescript
+const [a, setA] = createSignal(1);
+const [b, setB] = createSignal(2);
+
+// Memo 1 (pure)
+const sum = createMemo(() => {
+  console.log("1. Computing sum");
+  return a() + b();
+});
+
+// Memo 2 (pure)  
+const doubled = createMemo(() => {
+  console.log("2. Computing doubled");
+  return sum() * 2;
+});
+
+// Effect (not pure)
+createEffect(() => {
+  console.log("3. Effect:", doubled());
+});
+
+// Update both signals
+batch(() => {
+  setA(5);
+  setB(10);
+});
+```
+
+### Queue States
+
+```
+After batch(() => { setA(5); setB(10); }):
+
+Updates Queue:
+  [sum, doubled]  ← Both memos queued
+  
+Effects Queue:
+  [effect]        ← Effect queued
+
+Processing:
+  
+Step 1: Flush Updates
+  runQueue([sum, doubled])
+    runTop(sum)
+      → Logs: "1. Computing sum"
+      → sum.value = 15
+      → sum.state = 0
+    
+    runTop(doubled)
+      → Logs: "2. Computing doubled"
+      → doubled.value = 30
+      → doubled.state = 0
+  
+  Updates = null
+
+Step 2: Flush Effects
+  runEffects([effect])
+    runTop(effect)
+      → Reads doubled() = 30 (stable value!)
+      → Logs: "3. Effect: 30"
+      → effect.state = 0
+  
+  Effects = null
+
+Done! All queues empty.
+```
+
+## 🔍 Why Separate Queues Matter
+
+### Example 1: Diamond Dependency
+
+```typescript
+//       A
+//      / \
+//     B   C  (memos)
+//      \ /
+//       D   (effect)
+
+const [a, setA] = createSignal(1);
+const b = createMemo(() => a() * 2);
+const c = createMemo(() => a() * 3);
+
+createEffect(() => {
+  console.log(b() + c()); // Must see consistent b and c
+});
+
+setA(5);
+
+// Without separate queues:
+// Possible execution: b updates → effect runs (sees b=10, c=3) → c updates
+// Result: Inconsistent! Effect saw wrong values.
+
+// With separate queues:
+// 1. b updates (b=10)
+// 2. c updates (c=15)
+// 3. effect runs (sees b=10, c=15)
+// Result: Consistent! ✓
+```
+
+### Example 2: Cascading Updates
+
+```typescript
+const [trigger, setTrigger] = createSignal(false);
+const [count, setCount] = createSignal(0);
+
+createEffect(() => {
+  if (trigger()) {
+    setCount(c => c + 1); // Cascading update in effect
+  }
+});
+
+createEffect(() => {
+  console.log("Count:", count());
+});
+
+setTrigger(true);
+
+// Execution:
+// 1. First effect runs, calls setCount
+// 2. Second effect queued
+// 3. Second effect runs with updated count
+// All in correct order!
+```
+
+## 📊 Scheduling Priorities
+
+### The Three Effect Types
+
+```
+┌────────────────────────────────────────────┐
+│ HIGH PRIORITY (Updates Queue)              │
+│ • createComputed (pure: true)              │
+│ • createMemo (pure: true)                  │
+│ • Runs FIRST                               │
+│ • Can have observers                       │
+│ • Computes derived values                  │
+└─────────────────────┬──────────────────────┘
+                      ↓
+┌────────────────────────────────────────────┐
+│ MEDIUM PRIORITY (Effects Queue)            │
+│ • createRenderEffect (pure: false)         │
+│ • user: false                              │
+│ • Runs SECOND                              │
+│ • DOM manipulation, refs                   │
+│ • Before user sees changes                 │
+└─────────────────────┬──────────────────────┘
+                      ↓
+┌────────────────────────────────────────────┐
+│ LOW PRIORITY (Effects Queue, Deferred)     │
+│ • createEffect (pure: false)               │
+│ • user: true                               │
+│ • Runs LAST                                │
+│ • Side effects, logging, analytics         │
+│ • After DOM is stable                      │
+└────────────────────────────────────────────┘
+```
+
+### Why This Order Matters
+
+**createComputed:**
+```typescript
+// Runs immediately in Updates queue
+const [count, setCount] = createSignal(0);
+
+createComputed(() => {
+  console.log("Computed:", count());
+  // Always sees latest value
+  // Can have observers
+});
+```
+
+**createRenderEffect:**
+```typescript
+// Runs in Effects queue, before user effects
+let ref;
+
+createRenderEffect(() => {
+  // DOM manipulation happens here
+  ref.textContent = count();
+  ref.style.color = "blue";
+});
+// User sees updated DOM immediately
+```
+
+**createEffect:**
+```typescript
+// Runs AFTER render effects
+createEffect(() => {
+  // Side effects happen here
+  console.log("Count changed:", count());
+  analytics.track("count_change", count());
+});
+// DOM is already updated and stable
+```
+
+### The runUserEffects Implementation
+
+Solid.js uses **two separate runners** for effects:
+
+```typescript
+// From signal.ts
+let runEffects = runQueue; // Default runner
+
+export function createEffect<Next>(
+  fn: EffectFunction<undefined | NoInfer<Next>, Next>
+): void {
+  runEffects = runUserEffects; // ← Switch to user effect runner
+  const c = createComputation(fn, undefined!, false, STALE);
+  c.user = true; // Mark as user effect
+  
+  if (Effects) {
+    Effects.push(c);
+  } else {
+    updateComputation(c);
+  }
+}
+
+/**
+ * Runs render effects before user effects
+ */
+function runUserEffects(queue: Computation<any>[]): void {
+  let i, userLength = 0;
+  
+  // Phase 1: Run render effects (user: false)
+  for (i = 0; i < queue.length; i++) {
+    const e = queue[i];
+    if (!e.user) {
+      runTop(e); // DOM updates happen here
+    } else {
+      queue[userLength++] = e; // Collect user effects
+    }
+  }
+  
+  // Phase 2: Run user effects (user: true)
+  for (i = 0; i < userLength; i++) {
+    runTop(queue[i]); // Side effects happen here
+  }
+}
+```
+
+### Execution Flow Example
+
+```typescript
+const [count, setCount] = createSignal(0);
+
+// Updates queue
+const doubled = createMemo(() => {
+  console.log("1. Memo:", count() * 2);
+  return count() * 2;
+});
+
+// Effects queue (render effect)
+createRenderEffect(() => {
+  console.log("2. Render effect:", doubled());
+  document.title = `Count: ${doubled()}`;
+});
+
+// Effects queue (user effect)
+createEffect(() => {
+  console.log("3. User effect:", doubled());
+  localStorage.setItem("count", doubled().toString());
+});
+
+setCount(5);
+
+/* Output:
+1. Memo: 10
+2. Render effect: 10
+3. User effect: 10
+
+Order guaranteed:
+- Memos computed first (stable values)
+- Render effects (DOM updates)
+- User effects (side effects)
+*/
+```
+
+### Priority Testing
+
+```typescript
+test("effect priority order", () => {
+  const log: string[] = [];
+  const [s, setS] = createSignal(0);
+  
+  createComputed(() => log.push("computed"));
+  createRenderEffect(() => log.push("render"));
+  createEffect(() => log.push("effect"));
+  
+  log.length = 0;
+  setS(1);
+  
+  expect(log).toEqual(["computed", "render", "effect"]);
+});
+```
+
+## ✅ Implementation Checklist
+
+- [ ] Add `Updates` and `Effects` global queues
+- [ ] Update `writeSignal` to route by `pure` flag
+- [ ] Implement `runUpdates` with queue initialization
+- [ ] Implement `completeUpdates` to process both queues
+- [ ] Implement `runQueue` for basic queue processing
+- [ ] Implement `runUserEffects` for priority handling
+- [ ] Add effect type functions (createComputed, createRenderEffect)
+- [ ] Test with diamond dependencies
+- [ ] Test with cascading updates
+
+## 🧪 Testing
+
+```typescript
+test("memos before effects", () => {
+  const [s, setS] = createSignal(1);
+  const log: string[] = [];
+  
+  const memo = createMemo(() => {
+    log.push("memo");
+    return s() * 2;
+  });
+  
+  createEffect(() => {
+    log.push("effect");
+    memo();
+  });
+  
+  log.length = 0;
+  setS(2);
+  
+  expect(log).toEqual(["memo", "effect"]);
+  // Memo always runs before effect
+});
+
+test("consistent diamond reads", () => {
+  const [a, setA] = createSignal(1);
+  const b = createMemo(() => a() * 2);
+  const c = createMemo(() => a() * 3);
+  
+  let result = 0;
+  createEffect(() => {
+    result = b() + c();
+  });
+  
+  setA(5);
+  expect(result).toBe(25); // 10 + 15, both memos updated
+});
+```
+
+## 🔄 Complete Queue Processing Flow (No Ambiguity!)
+
+### The Exact Order of Operations
+
+```
+┌─────────────────────────────────────────┐
+│ 1. Synchronous Code Executes           │
+│    - setFirstName('Jane')               │
+│    - setLastName('Smith')               │
+│    - Both signals updated               │
+└───────────────┬─────────────────────────┘
+                ↓
+┌─────────────────────────────────────────┐
+│ 2. Marking Phase (synchronous)         │
+│    - fullName memo → STALE → Updates   │
+│    - effect → STALE → Effects          │
+│    - NO execution yet!                  │
+└───────────────┬─────────────────────────┘
+                ↓
+┌─────────────────────────────────────────┐
+│ 3. Flush Updates Queue (synchronous)   │
+│    FOR EACH memo in Updates:           │
+│      - Check state === STALE           │
+│      - If true, updateComputation()    │
+│      - Memo may access other memos     │
+│      - All memos become CLEAN          │
+│    GUARANTEE: All memos updated        │
+└───────────────┬─────────────────────────┘
+                ↓
+┌─────────────────────────────────────────┐
+│ 4. Schedule Effects (microtask)        │
+│    - queueMicrotask(() => flush)       │
+│    - Return to synchronous code        │
+└───────────────┬─────────────────────────┘
+                ↓
+┌─────────────────────────────────────────┐
+│ 5. Synchronous Code Completes          │
+│    - console.log("done") etc.          │
+└───────────────┬─────────────────────────┘
+                ↓
+┌─────────────────────────────────────────┐
+│ 6. Microtask Queue Processes           │
+│    FOR EACH effect in Effects:         │
+│      - Check state === STALE           │
+│      - If true, updateComputation()    │
+│      - Effect accesses CLEAN memos     │
+│      - All effects become CLEAN        │
+│    GUARANTEE: Effects see final values │
+└─────────────────────────────────────────┘
+```
+
+### Re-Entrancy: What If Effect Updates Signal?
+
+**Question:** What if an effect updates a signal?
+
+```typescript
+createEffect(() => {
+  if (someCondition()) {
+    setCount(5);  // ← Re-entrant update!
+  }
+});
+```
+
+**Answer:** Creates a NEW update cycle!
+
+```
+Effect runs →  Calls setSignal() → runUpdates() called
+                                      ↓
+                        Check: if (Updates) return fn();
+                                      ↓
+                               Updates exists!
+                                      ↓
+                          Just mark, don't flush
+                                      ↓
+                        Current effect completes
+                                      ↓
+                     Effects queue processes next
+                                      ↓
+                    After all effects, flush new Updates
+```
+
+**Key:** The `if (Updates)` check prevents nested flushes!
+
+### Can Memos Trigger Effects?
+
+**Yes!** Indirectly through the queue system:
+
+```typescript
+const [count, setCount] = createSignal(0);
+
+const doubled = createMemo(() => {
+  const value = count() * 2;
+  // Memo might have side effect (though not recommended)
+  if (value > 10) {
+    setOtherSignal(value);  // Triggers new cycle!
+  }
+  return value;
+});
+
+createEffect(() => doubled());
+```
+
+**Flow:**
+1. Effect accesses doubled
+2. Doubled recomputes (on-access)
+3. Doubled calls setOtherSignal
+4. New runUpdates cycle starts
+5. But current effect continues first
+6. Then new cycle processes
+
+**Rule:** Current cycle completes before new one starts!
+
+### Why Effects Can't Have Observers
+
+**Question:** Why can't effects have observers?
+
+```typescript
+// This is NOT allowed:
+const effect = createEffect(() => count());
+const observer = createMemo(() => effect());  // ❌ Error!
+```
+
+**Answer:** Effects don't return stable values!
+
+1. **Effects are imperative:**
+   - They run for side effects
+   - Return value is undefined
+   - No meaningful value to observe
+
+2. **Would break queue guarantees:**
+   - If effect had observers, they'd be effects too
+   - Would need to run after effect
+   - But effect is already in Effects queue!
+   - Circular dependency problem
+
+3. **Design decision:**
+   - Effects are leaves in the reactive graph
+   - They consume, never produce
+   - Clear separation of concerns
+
+### Processing Order Example
+
+```typescript
+const [a, setA] = createSignal(1);
+const [b, setB] = createSignal(2);
+
+const sum = createMemo(() => a() + b());      // Memo 1
+const doubled = createMemo(() => sum() * 2);  // Memo 2
+
+createEffect(() => console.log(doubled()));   // Effect 1
+createEffect(() => console.log(sum()));       // Effect 2
+
+setA(5);
+setB(10);
+
+// Processing order:
+// 1. Mark: sum → STALE, doubled → STALE, effect1 → STALE, effect2 → STALE
+// 2. Flush Updates:
+//    - runTop(sum) → computes: 15
+//    - runTop(doubled) → computes: 30
+// 3. ALL Updates complete (guaranteed!)
+// 4. Flush Effects (microtask):
+//    - effect1 runs → logs 30
+//    - effect2 runs → logs 15
+// 5. Done!
+```
+
+### Nested Computations
+
+**Question:** What if memo creates another memo?
+
+```typescript
+const outer = createMemo(() => {
+  const inner = createMemo(() => count() * 2);
+  return inner() * 3;
+});
+```
+
+**Answer:** Inner memo is owned by outer!
+
+1. Outer memo recomputes
+2. Creates new inner memo (disposes old one)
+3. Inner memo immediately computes (on-access)
+4. Outer uses inner's value
+5. Outer completes
+
+**Timing:** All synchronous during outer's recomputation!
+
+## 🚀 Next Step
+
+Continue to **[07-memo-implementation.md](./07-memo-implementation.md)** to implement production-ready memos that can have observers.
+
+---
+
+**💡 Pro Tip**: Queue separation is the secret to Solid's "glitch-free" updates. Memos first, effects second = always consistent!

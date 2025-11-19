@@ -745,6 +745,295 @@ setA(5);  // Triggers writeSignal
    - PENDING state ensures upstream consistency
    - Only see final, stable values
 
+## ⏱️ Critical: When Do Computations Actually Execute?
+
+### The Lazy Evaluation Model
+
+Solid.js memos use **pull-based lazy evaluation**. This is crucial to understand:
+
+```typescript
+const [count, setCount] = createSignal(0);
+
+const doubled = createMemo(() => {
+  console.log("Computing doubled");
+  return count() * 2;
+});
+
+console.log("1. Before update");
+setCount(5);
+console.log("2. After update (memo NOT computed yet!)");
+console.log("3. Accessing memo...");
+const value = doubled();  // ← Computation happens HERE
+console.log("4. Got value:", value);
+
+// Output:
+// 1. Before update
+// 2. After update (memo NOT computed yet!)
+// 3. Accessing memo...
+// Computing doubled  ← Only computes when accessed!
+// 4. Got value: 10
+```
+
+### Two Execution Paths
+
+#### Path 1: On-Access (Memos)
+
+```typescript
+// Memo marked STALE by signal update
+doubled();  // ← Access triggers recomputation
+
+// Internally:
+function readSignal() {
+  if (this.state === STALE) {
+    updateComputation(this);  // Compute NOW
+  }
+  return this.value;
+}
+```
+
+**When:** On read/access  
+**Who:** Calling code (effect, another memo, or user)  
+**Trigger:** Reading the value
+
+#### Path 2: During Flush (Effects)
+
+```typescript
+// Effect marked STALE by signal update
+// Effects run during flush (microtask in our implementation)
+
+// Internally (in completeUpdates):
+for (const effect of Effects) {
+  if (effect.state === STALE) {
+    updateComputation(effect);  // Compute during flush
+  }
+}
+```
+
+**When:** During queue flush (microtask)  
+**Who:** Reactive system  
+**Trigger:** Queue processing
+
+### The Key Difference
+
+```typescript
+const [count, setCount] = createSignal(0);
+
+// MEMO: Lazy (pull)
+const doubled = createMemo(() => count() * 2);
+
+// EFFECT: Eager flush (push)
+createEffect(() => console.log(doubled()));
+
+setCount(5);
+// → Memo: Marked STALE, waiting...
+// → Effect: Marked STALE, added to Effects queue
+// → (Microtask): Effect flushes
+//   → Effect accesses doubled()
+//   → Doubled recomputes (on-access!)
+//   → Effect logs the value
+```
+
+### Multiple Accesses = One Computation
+
+```typescript
+const [count, setCount] = createSignal(0);
+const doubled = createMemo(() => {
+  console.log("Computing!");
+  return count() * 2;
+});
+
+setCount(5);
+
+// Multiple accesses in same cycle:
+doubled();  // Logs "Computing!" → Returns 10
+doubled();  // Returns 10 (cached, no log)
+doubled();  // Returns 10 (cached, no log)
+
+// State after first access: CLEAN
+// Subsequent reads see CLEAN state → return cached value
+```
+
+### Why This Matters
+
+**Performance:**
+```typescript
+const expensive = createMemo(() => {
+  // Imagine this takes 1 second
+  return heavyComputation();
+});
+
+// Signal updated 100 times
+for (let i = 0; i < 100; i++) {
+  setCount(i);  // Memo marked STALE each time
+}
+
+// Only computes ONCE on access!
+const result = expensive();  // ← 1 second (not 100 seconds!)
+```
+
+**Never Accessed = Never Computed:**
+```typescript
+const unused = createMemo(() => {
+  console.log("This will never run!");
+  return count() * 2;
+});
+
+setCount(1);
+setCount(2);
+setCount(3);
+// No logs! Memo never accessed = never computed
+
+// This is pure laziness - ultimate optimization!
+```
+
+## 🔑 Critical Difference: Memos vs Effects
+
+Now that you understand lazy evaluation, it's crucial to understand how memos differ from effects:
+
+### Memos: Lazy (Pull-based)
+
+```typescript
+const [count, setCount] = createSignal(0);
+
+const doubled = createMemo(() => {
+  console.log("Computing doubled");
+  return count() * 2;
+});
+
+setCount(5);  // Memo marked STALE, NOT computed yet!
+console.log("Between updates");
+doubled();    // NOW it computes!
+console.log("After access");
+
+// Output:
+// Between updates
+// Computing doubled  ← Happens on access!
+// After access
+```
+
+**Trigger:** Access (reading the value)  
+**Timing:** On-demand, when read  
+**Purpose:** Cached derived values  
+**Optimization:** Never accessed = never computed
+
+### Effects: Eager (Push-based)
+
+```typescript
+const [count, setCount] = createSignal(0);
+
+createEffect(() => {
+  console.log("Effect sees:", count());
+});
+
+setCount(5);  // Effect flushes IMMEDIATELY!
+// ↑ Effect already ran (synchronously)
+console.log("After update");
+
+// Output:
+// Effect sees: 0  ← Initial run
+// Effect sees: 5  ← Ran synchronously in setCount!
+// After update
+```
+
+**Trigger:** Signal update  
+**Timing:** Synchronous flush  
+**Purpose:** Side effects  
+**Guarantee:** Always runs (can't skip)
+
+### Why This Matters
+
+```typescript
+const [count, setCount] = createSignal(0);
+
+// Memo: Only computes if accessed
+const expensive = createMemo(() => {
+  console.log("Expensive computation");
+  let result = 0;
+  for (let i = 0; i < 1000000; i++) {
+    result += Math.sqrt(i);
+  }
+  return result;
+});
+
+setCount(1);  // NOT computed yet!
+setCount(2);  // Still not computed!
+setCount(3);  // Still not computed!
+console.log("Memos not computed yet!");
+
+expensive();  // NOW it computes ONCE with final value!
+
+// VS
+
+// Effect: Always runs on change
+createEffect(() => {
+  console.log("Effect runs");
+  let result = 0;
+  for (let i = 0; i < 1000000; i++) {
+    result += Math.sqrt(i);
+  }
+  return result;
+});
+
+setCount(1);  // Runs immediately! (expensive!)
+setCount(2);  // Runs again! (expensive!)
+setCount(3);  // Runs again! (expensive!)
+// 3 expensive computations!
+```
+
+### Performance Comparison
+
+| Scenario | Memo | Effect |
+|----------|------|--------|
+| Signal updated | Marked STALE | Runs immediately |
+| Multiple updates | Marks STALE each time | Runs each time |
+| Never accessed | Never computes ✅ | Always runs ❌ |
+| Accessed once | Computes once ✅ | N/A |
+| Accessed multiple times | Returns cached ✅ | N/A |
+| **Best for** | Derived values | Side effects |
+
+### Use Cases
+
+**Use Memos When:**
+```typescript
+// Deriving values
+const fullName = createMemo(() => `${first()} ${last()}`);
+
+// Expensive computations
+const filtered = createMemo(() => items().filter(predicate));
+
+// Complex calculations
+const stats = createMemo(() => calculateStatistics(data()));
+```
+
+**Use Effects When:**
+```typescript
+// DOM updates
+createEffect(() => {
+  element.textContent = message();
+});
+
+// Logging/debugging
+createEffect(() => {
+  console.log("State changed:", state());
+});
+
+// External sync
+createEffect(() => {
+  saveToLocalStorage(data());
+});
+```
+
+### Key Insight
+
+**Memos are performance optimizations** (lazy, cached)  
+**Effects are for side effects** (eager, always run)
+
+Choose based on your needs:
+- Need a derived value? → Memo
+- Need a side effect? → Effect
+- Want to skip computation? → Memo (it might not run!)
+- Must always execute? → Effect (it will always run!)
+
 ## 🚀 Next Step
 
 Continue to **[06-effect-scheduling.md](./06-effect-scheduling.md)** to implement proper effect queuing and execution order.

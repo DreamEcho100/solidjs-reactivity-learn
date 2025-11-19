@@ -1,12 +1,13 @@
 /** biome-ignore-all lint/suspicious/noAssignInExpressions: <explanation> */
-import type { Memo, MemoOptions, SignalState } from "./reactive-types.ts";
 import { CLEAN, IS_DEV, PENDING, STALE, UNOWNED_OWNER } from "./constants.ts";
 import type {
-  Owner,
   Computation,
-  EffectFunction,
   ComputationState,
+  EffectFunction,
   EffectOptions,
+  Memo,
+  Owner,
+  SignalState,
 } from "./reactive-types.ts";
 
 /**
@@ -168,7 +169,25 @@ export let CURRENT_OWNER: Owner | null = null;
  * When you read a signal, it subscribes this Listener
  */
 export let CURRENT_LISTENER: Computation<any, any> | null = null;
+
 /**
+ * @fileoverview
+ *
+ * ```js
+ * createEffect(() => {
+ *   // Owner = this effect
+ *   // Listener = this effect
+ *
+ *   const value = untrack(() => signal());
+ *   // Owner = still this effect (can create children)
+ *   // Listener = null (won't subscribe to signal)
+ * });
+ * ```
+ */
+
+/**
+ * @fileoverview
+ *
  * Multiple queues for different priorities
  *
  * **Process in order:**
@@ -243,33 +262,46 @@ export function createRoot<T>(
 
   /**
    * Determine if root should have a dispose function
-   * We can do this by checking if the function is named or not, because anonymous
-   * functions have an empty string as their name.
+   * We can do this by checking if the function has zero parameters.
+   * If it does, we treat it as unowned (no dispose needed).
    *
-   * @example
+   * Why This Matters:
+   * - **Memory Management**: Unowned roots don't need cleanup,
+   *   reducing overhead for simple cases.
+   * - **Developer Intent**: Function signature indicates
+   *
+   * **When Roots Are Unowned:**
    *
    * ```js
-   * // Anonymous function (unowned)
+   * // Anonymous function (0 parameters) = unowned
    * createRoot(() => {
-   *   // ...
-   * });
-   * ```
-   *
-   * ```js
-   * // Named function (owned)
-   * createRoot(function myRoot(dispose) {
-   *   // ...
+   *   // owner = UNOWNED
+   *   // No cleanup needed
    * });
    *
-   * // Or
+   * // Named function OR function with parameter = owned
+   * createRoot((dispose) => {
+   *   // owner = new Owner object
+   *   // Can be cleaned up via dispose()
+   * });
    *
-   * function myRoot(dispose) {
+   * // Detection:
+   * function createRoot(fn, detachedOwner) {
+   *   const unowned = fn.length === 0; // Check parameter count
+   *
+   *   const rootOwner = unowned
+   *     ? UNOWNED  // Reuse singleton
+   *     : {        // Create new owner
+   *         owned: null,
+   *         cleanups: null,
+   *         context: parentOwner?.context ?? null,
+   *         owner: parentOwner
+   *       };
    *   // ...
    * }
-   * createRoot(myRoot);
    * ```
    */
-  const unowned = fn.name.length === 0;
+  const unowned = fn.length === 0;
 
   /** Get parent owner (if detached, use that; otherwise current) */
   const parentOwner = detachedOwner ?? prevOwner;
@@ -286,25 +318,25 @@ export function createRoot<T>(
         owner: parentOwner,
       };
 
-  // Set up the function to call
+  /** Set up the function to call */
   const updateFn = unowned
-    ? fn // Call directly (no dispose parameter)
+    ? fn /** Call directly (no dispose parameter) */
     : () =>
         fn(() => {
-          // Dispose function cleans up the entire root
+          /** Dispose function cleans up the entire root */
           untrack(() => cleanNode(rootOwner));
         });
 
-  // Set root as current owner
+  /** Set root as current owner */
   CURRENT_OWNER = rootOwner;
-  // Roots don't subscribe to signals
+  /** Roots don't subscribe to signals */
   CURRENT_LISTENER = null;
   try {
     return (updateFn as () => T)();
   } catch (error) {
-    // handleError(error)
+    /** handleError(error) */
   } finally {
-    // Restore previous context
+    /** Restore previous context */
     CURRENT_OWNER = prevOwner;
     CURRENT_LISTENER = prevListener;
   }
@@ -375,7 +407,7 @@ function createComputation<Next, Init = unknown>(
   if (IS_DEV && options && options.name) comp.name = options.name;
 
   /*
-	// TODO: ExternalSourceConfig and Transition are not defined in this context
+  // TODO: ExternalSourceConfig and Transition are not defined in this context
   if (IS_DEV && options && options.name) c.name = options.name;
 
   if (ExternalSourceConfig && c.fn) {
@@ -392,7 +424,7 @@ function createComputation<Next, Init = unknown>(
   }
 
   if (IS_DEV) DevHooks.afterCreateOwner && DevHooks.afterCreateOwner(c);
-	*/
+  */
 
   return comp;
 }
@@ -439,7 +471,7 @@ export function runComputation(
     nextValue = node.fn(value);
   } catch (error) {
     /*
-		// TODO:
+    // TODO:
     if (node.pure) {
       if (Transition && Transition.running) {
         node.tState = STALE;
@@ -453,7 +485,7 @@ export function runComputation(
     }
     // won't be picked up until next update
     node.updatedAt = time + 1;
-		*/
+    */
     // Handle error (covered in later step)
     handleError(error);
     return;
@@ -786,8 +818,12 @@ function lookUpstream(node: Computation<any>, ignore?: Computation<any>): void {
   }
 }
 
-export function writeSignal<T>(node: SignalState<T>, value: T) {
-  // Check if value actually changed
+export function writeSignal<T>(
+  node: SignalState<T>,
+  value: T,
+  isComp?: boolean
+) {
+  /** Check if value actually changed */
   if (!(node.comparator ?? defaultComparator)(node.value, value)) {
     node.value = value;
     /**
@@ -877,28 +913,29 @@ export function writeSignal<T>(node: SignalState<T>, value: T) {
      * // Now sum is clean, ready to re-execute and create new dependencies
      * ```
      */
-    // Notify all observers
+    /** Notify all observers */
     if (node.observers?.length) {
-      // ← THIS IS WHERE THE MAGIC HAPPENS!!! ✨
+      /** ← THIS IS WHERE THE MAGIC HAPPENS!!! ✨ */
       runUpdates(() => {
-        // Mark all observers as STALE
+        /** Mark all observers as STALE */
         for (let i = 0; i < node.observers!.length; i++) {
           const obs = node.observers![i]!;
 
-          // Mark as stale
+          /** Only mark if currently CLEAN */
           if (obs.state === CLEAN) {
-            if (obs.pure) Updates!.push(obs); // Memo: add to Updates
-            else Effects!.push(obs); // Effect: add to Effect
+            /** Add to appropriate queue */
+            if (obs.pure) Updates!.push(obs); /** Memo: add to Updates */
+            else Effects!.push(obs); /** Effect: add to Effect */
 
-            // If this is a memo with observers, mark them too
+            /** If this is a memo with observers, mark them too _(propagate the staleness downstream)_ */
             if ((obs as Memo<any>).observers?.length) {
               markDownstream(obs as Memo<any>);
             }
           }
-          obs.state = STALE;
+          obs.state = STALE; /* Mark as STALE _(need to update)_ */
         }
       }, false);
-      // ← init=false means DON'T flush effects yet - they batch automatically!
+      /** ← `init=false` means effects batch automatically **within this update cycle** */
     }
   }
 
@@ -929,17 +966,17 @@ function markDownstream(node: Memo<any>): void {
 /**
  * Core update cycle that manages queue creation and flushing
  * This is what makes batching and proper execution order work!
- * 
+ *
  * @param fn - Function that marks computations as STALE
  * @param init - If true, flush effects immediately. If false, batch them.
  */
-function runUpdates(fn: () => void, init: boolean) {
-  // If we're already batching, just mark (don't create new queues)
+function runUpdates<T>(fn: () => T, init: boolean) {
+  /** If we're already batching, just mark (don't create new queues) */
   if (Updates) {
     return fn();
   }
 
-  // Track if we should wait before flushing effects
+  /** Track if we should wait before flushing effects */
   let wait = false;
   if (!init) Updates = [];
   if (Effects) wait = true; // Effects already exist, don't flush yet!
@@ -947,7 +984,7 @@ function runUpdates(fn: () => void, init: boolean) {
 
   ExecCount++; // Increment for topological ordering
   try {
-    // Run the marking function (this adds computations to queues)
+    /** Run the marking function (this adds computations to queues) */
     const result = fn();
     completeUpdates(wait);
     return result;
@@ -961,20 +998,41 @@ function runUpdates(fn: () => void, init: boolean) {
 /**
  * Completes the update cycle by flushing queues
  * This is where automatic batching happens!
- * 
+ *
  * @param wait - If true, skip flushing effects (batch them)
+ *
+ * **Execution Flow:**
+ * ```
+ * Signal Change
+ *      ↓
+ * Add to Updates queue (if computation.pure)
+ * Add to Effects queue (if !computation.pure)
+ *      ↓
+ * Flush Updates
+ *      ↓
+ * [Memo1, Memo2, Memo3] ← All memos compute
+ *      ↓
+ * Flush Effects
+ *      ↓
+ * [Effect1, Effect2] ← Run with stable memo values
+ * ```
+ *
+ * **Why This Matters:**
+ * - **Correctness**: Effects see consistent derived state
+ * - **Predictability**: Memos always update before effects
+ * - **Performance**: Batch similar work together
  */
 function completeUpdates(wait: boolean) {
-  // 1. Always flush Updates queue (memos)
+  /** 1. Always flush Updates queue (memos) */
   if (Updates) {
     runQueue(Updates);
     Updates = null;
   }
 
-  // 2. If wait=true, effects batch until next microtask
+  /** 2. If wait=true, effects batch until next microtask */
   if (wait) return;
 
-  // 3. Finally flush Effects queue
+  /** 3. Finally flush Effects queue */
   const e = Effects!;
   Effects = null;
   if (e.length) runUpdates(() => runEffects(e), false);
@@ -1000,26 +1058,179 @@ function runEffects(queue: Computation<any, any>[]) {
 }
 
 /**
- * Manually batch multiple signal updates
- * Useful for batching memo updates and preventing intermediate computations
- * 
- * Note: Effects batch automatically (via init=false in writeSignal),
- * but batch() is still useful for optimizing memo computations!
- * 
+ * Batches multiple signal updates together
+ * Effects only run once after all updates complete
+ *
  * @example
+ *
  * ```typescript
- * // Without batch: memo computes 3 times
- * setA(1);  // memo computes
- * setB(2);  // memo computes
- * setC(3);  // memo computes
- * 
- * // With batch: memo computes ONCE
+ * // Without batch - effect runs twice
+ * setFirstName("Jane");  // Effect runs
+ * setLastName("Smith");  // Effect runs again
+ *
+ * // With batch - effect runs once
  * batch(() => {
- *   setA(1);
- *   setB(2);
- *   setC(3);
- * }); // memo computes once with all final values!
+ *   setFirstName("Jane");
+ *   setLastName("Smith");
+ * }); // Effect runs once with both changes
  * ```
+ *
+ * **When do you need `batch`?**
+ *
+ * ```js
+ * // Top-level multiple updates
+ * function updateUserProfile() {
+ *   batch(() => {
+ *     setFirstName("Jane");
+ *     setLastName("Smith");
+ *     setAge(30);
+ *   });
+ * }
+ *
+ * // Event handlers
+ * button.onclick = () => {
+ *   batch(() => {
+ *     setCount(count() + 1);
+ *     setTimestamp(Date.now());
+ *   });
+ * };
+ *
+ * // Async operations
+ * async function fetchData() {
+ *   const data = await apiCall();
+ *   batch(() => {
+ *     setData(data);
+ *     setLoading(false);
+ *   });
+ * }
+ *
+ * // Complex computations
+ * function complexCalculation() {
+ *   batch(() => {
+ *     setValueA(computeA());
+ *     setValueB(computeB());
+ *     setValueC(computeC());
+ *   });
+ * }
+ *
+ * // Multiple related signals
+ * function updateSettings() {
+ *   batch(() => {
+ *     setSetting1(true);
+ *     setSetting2(false);
+ *     setSetting3("custom");
+ *   });
+ * }
+ *
+ * // UI interactions
+ * function onUserAction() {
+ *   batch(() => {
+ *     setIsActive(true);
+ *     setLastAction(Date.now());
+ *   });
+ * }
+ *
+ * // State initialization
+ * function initializeState() {
+ *   batch(() => {
+ *     setInitialValue1(100);
+ *     setInitialValue2("default");
+ *   });
+ * }
+ *
+ * // Animation frames
+ * function onAnimationFrame() {
+ *   batch(() => {
+ *     setPositionX(calculateX());
+ *     setPositionY(calculateY());
+ *   });
+ * }
+ * ```
+ *
+ * **When NOT to use `batch`:**
+ *
+ * ```js
+ * // Single updates - no need to batch
+ * setCount(count() + 1);
+ *
+ * // Independent updates - unrelated signals
+ * setUserName("Alice");
+ * setTheme("dark");
+ *
+ * // Simple effects - let them run naturally
+ * createEffect(() => {
+ *   console.log("Count changed:", count());
+ * });
+ * ```
+ *
+ * **How `batch` Works Internally:**
+ *
+ * ```typescript
+ * // Initial state:
+ * const [a, setA] = createSignal(2);
+ * const [b, setB] = createSignal(5);
+ *
+ * const sum = createMemo(() => {
+ *   console.log("Computing sum");
+ *   return a() + b();
+ * });
+ *
+ * const doubled = createMemo(() => {
+ *   console.log("Computing doubled");
+ *   return sum() * 2;
+ * });
+ *
+ * createEffect(() => {
+ *   console.log("Result:", doubled());
+ * });
+ *
+ * // Now, we batch updates:
+ * batch(() => {
+ *   setA(3); // sum.state = STALE
+ *   setB(4); // sum already STALE
+ * });
+ * ```
+ *
+ * **Execution Steps:**
+ *
+ * 1. setA(3)
+ *   - a.value = 3
+ *   - markDownstream(sum)
+ *   - sum.state = STALE
+ *   - Add sum to Updates queue
+ *
+ * 2. setB(4)
+ *   - b.value = 4
+ *   - markDownstream(sum) (already STALE)
+ *  - sum.state = STALE
+ *  - sum already in Updates queue
+ *
+ * 3. completeUpdates()
+ *  - Flush Updates queue:
+ *   - runTop(sum)
+ *    - sum.state = STALE
+ *   - updateComputation(sum)
+ *   - Logs: "Computing sum"
+ *  - sum.value = 7
+ *  - markDownstream(doubled)
+ *  - doubled.state = STALE
+ * - Add doubled to Updates queue
+ *
+ * - Flush Updates queue:
+ * - runTop(doubled)
+ * - doubled.state = STALE
+ * - updateComputation(doubled)
+ * - Logs: "Computing doubled"
+ * - doubled.value = 14
+ * - markDownstream(effect)
+ * - effect.state = STALE
+ * - Add effect to Effects queue
+ *
+ * - Flush Effects queue:
+ * - runEffects([effect])
+ * - effect.state = STALE
+ * - updateComputation(effect)
+ * - Logs: "Result: 14"
  */
 export function batch<T>(fn: () => T): T {
   return runUpdates(fn, false) as T;

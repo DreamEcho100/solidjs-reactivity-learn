@@ -1,116 +1,43 @@
-# Step 9: Transitions - Concurrent Mode for React-like Non-Blocking Updates
+# Step 9: Transitions - Concurrent Mode
 
 ## 🎯 Goal
-Implement Solid.js's complete transition system for non-blocking UI updates, including promise tracking, disposed computation handling, and scheduler integration.
-
-## 🚨 Prerequisites
-
-This lesson requires deep understanding of:
-- **Lesson 6**: Scheduling (runUpdates, completeUpdates, Updates/Effects queues)
-- **Lesson 7**: Memos (tValue, tOwned fields)
-- **Lesson 5**: States (STALE, PENDING, Clean)
-- **Lesson 3**: Ownership (Owner, cleanNode)
-
-**You must master these first** - transitions are the most complex feature!
-
----
+Implement transitions for non-blocking UI updates that keep your app responsive during expensive state changes.
 
 ## 🤔 The Problem: Blocking Updates
 
-### What Happens Without Transitions
-
 ```typescript
 const [search, setSearch] = createSignal("");
-const [items] = createSignal(Array.from({ length: 10000 }, (_, i) => ({
-  id: i,
-  name: `Item ${i}`,
-  description: `Description for item ${i}`
-})));
+const [items, setItems] = createSignal([]);
 
-// Expensive filtering operation
+// Expensive filtering
 const filtered = createMemo(() => {
-  console.log("Filtering..."); // This blocks!
   return items().filter(item => 
-    item.name.toLowerCase().includes(search().toLowerCase()) ||
-    item.description.toLowerCase().includes(search().toLowerCase())
+    item.name.includes(search())
   );
 });
 
 createEffect(() => {
-  // Render 10,000 items - blocks UI!
-  render(filtered());
+  render(filtered()); // Blocks UI!
 });
 
 // User types in search box
-input.addEventListener('input', (e) => {
-  setSearch(e.target.value); // ❌ UI FREEZES for 200-500ms!
-  // User sees lag, input feels sluggish
-  // No way to cancel if user keeps typing
-});
+setSearch("a"); // UI freezes while filtering 10,000 items 😱
 ```
-
-### The Real-World Impact
-
-```
-User Experience WITHOUT Transitions:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-User types "a"     → UI freezes 300ms 😱
-User types "b"     → UI freezes 300ms 😱
-User types "c"     → UI freezes 300ms 😱
-Total: 900ms of frozen UI!
-
-User sees: Stuttering, lag, poor responsiveness
-User thinks: "This app is slow and buggy"
-```
-
----
 
 ## 🌟 The Solution: Transitions
 
-### How Transitions Fix This
-
 ```typescript
 const [search, setSearch] = createSignal("");
-const [isPending, startTransition] = useTransition();
-
-// Expensive filtering (same code)
-const filtered = createMemo(() => {
-  console.log("Filtering...");
-  return items().filter(item => 
-    item.name.toLowerCase().includes(search().toLowerCase())
-  );
-});
+const [pending, setPending] = createSignal(false);
 
 // Wrap expensive update in transition
-input.addEventListener('input', (e) => {
-  // ✅ Update happens non-blocking!
+const handleSearch = (value: string) => {
   startTransition(() => {
-    setSearch(e.target.value);
+    setSearch(value); // Non-blocking!
   });
-  
-  // Input remains responsive
-  // User can keep typing
-  // Old results shown while computing
-});
+};
 
-// Show loading indicator
-createEffect(() => {
-  loadingSpinner.style.display = isPending() ? 'block' : 'none';
-});
-```
-
-### The Dramatic Improvement
-
-```
-User Experience WITH Transitions:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-User types "a"     → Input updates immediately, computation deferred
-User types "b"     → Input updates immediately, computation deferred  
-User types "c"     → Input updates immediately, computation deferred
-Computation runs once for "abc" (300ms, but non-blocking!)
-
-User sees: Smooth, responsive input
-User thinks: "This app is fast and polished"
+// UI stays responsive! Old results show while computing
 ```
 
 ## 📊 How Transitions Work

@@ -600,16 +600,191 @@ createRoot(dispose => {
 });
 ```
 
+## 🎯 Complete Implementation Guide
+
+### File Structure
+
+```
+src/
+├── reactive-types.ts      (from lesson 02)
+├── reactive-core.ts       (new - ownership implementation)
+├── reactive-signals.ts    (updated later)
+└── reactive-effects.ts    (updated later)
+```
+
+### Step-by-Step Implementation
+
+#### File: `reactive-core.ts`
+
+```typescript
+import { Owner, Computation, UNOWNED } from './reactive-types';
+
+// ============================================================================
+// GLOBAL CONTEXT
+// ============================================================================
+
+/**
+ * Currently executing owner (can create child computations)
+ */
+export let Owner: Owner | null = null;
+
+/**
+ * Currently executing computation (subscribes to signals)
+ */
+export let Listener: Computation<any> | null = null;
+
+// ============================================================================
+// OWNER MANAGEMENT
+// ============================================================================
+
+/**
+ * Creates a root-level reactive scope
+ */
+export function createRoot<T>(
+  fn: (dispose: () => void) => T,
+  detachedOwner?: Owner
+): T {
+  const listener = Listener;
+  const owner = Owner;
+  const unowned = fn.length === 0;
+  const current = detachedOwner === undefined ? owner : detachedOwner;
+  
+  const root: Owner = unowned
+    ? UNOWNED
+    : {
+        owned: null,
+        cleanups: null,
+        context: current ? current.context : null,
+        owner: current
+      };
+  
+  const updateFn = unowned
+    ? fn
+    : () => fn(() => untrack(() => cleanNode(root)));
+  
+  Owner = root;
+  Listener = null;
+  
+  try {
+    return updateFn() as T;
+  } finally {
+    Listener = listener;
+    Owner = owner;
+  }
+}
+
+/**
+ * Runs function without tracking dependencies
+ */
+export function untrack<T>(fn: () => T): T {
+  const listener = Listener;
+  Listener = null;
+  try {
+    return fn();
+  } finally {
+    Listener = listener;
+  }
+}
+
+/**
+ * Registers a cleanup function with current owner
+ */
+export function onCleanup(fn: () => void): void {
+  if (Owner) {
+    if (!Owner.cleanups) Owner.cleanups = [fn];
+    else Owner.cleanups.push(fn);
+  }
+}
+
+// ============================================================================
+// CLEANUP
+// ============================================================================
+
+/**
+ * Recursively cleans up a node and its children
+ */
+export function cleanNode(node: Owner): void {
+  // 1. Dispose all owned children (recursive, reverse order)
+  if (node.owned) {
+    for (let i = node.owned.length - 1; i >= 0; i--) {
+      cleanNode(node.owned[i]);
+    }
+    node.owned = null;
+  }
+  
+  // 2. Remove from dependency graph (if computation)
+  if ((node as Computation<any>).sources) {
+    const comp = node as Computation<any>;
+    
+    while (comp.sources && comp.sources.length) {
+      const source = comp.sources.pop()!;
+      const index = comp.sourceSlots!.pop()!;
+      const obs = source.observers;
+      
+      if (obs && obs.length) {
+        const n = obs.pop()!;
+        const s = source.observerSlots!.pop()!;
+        
+        if (index < obs.length) {
+          n.sourceSlots![s] = index;
+          obs[index] = n;
+          source.observerSlots![index] = s;
+        }
+      }
+    }
+  }
+  
+  // 3. Run cleanup functions (reverse order)
+  if (node.cleanups) {
+    for (let i = node.cleanups.length - 1; i >= 0; i--) {
+      node.cleanups[i]();
+    }
+    node.cleanups = null;
+  }
+  
+  // 4. Reset state
+  (node as Computation<any>).state = 0;
+}
+```
+
 ## ✅ Implementation Checklist
 
+### Phase 1: Core Setup (30 minutes)
+- [ ] Create `reactive-core.ts` file
 - [ ] Add `Owner` and `Listener` globals
-- [ ] Implement `createRoot`
-- [ ] Update `createComputation` to register with owner
-- [ ] Modify `runComputation` to set Owner/Listener
-- [ ] Implement `cleanNode` for recursive cleanup
-- [ ] Update `updateComputation` to clean before re-run
-- [ ] Test with nested effects
+- [ ] Copy type imports from `reactive-types.ts`
+- [ ] Verify TypeScript compilation
+
+### Phase 2: Root Creation (45 minutes)
+- [ ] Implement `createRoot` function
+- [ ] Add UNOWNED optimization logic
+- [ ] Implement `untrack` utility
+- [ ] Test basic root creation
+- [ ] Test root with dispose function
+- [ ] Test nested roots
+
+### Phase 3: Cleanup Implementation (1 hour)
+- [ ] Implement `cleanNode` function
+- [ ] Add owned children disposal logic
+- [ ] Add dependency graph cleanup
+- [ ] Add cleanup functions execution
+- [ ] Test recursive cleanup
 - [ ] Verify no memory leaks
+
+### Phase 4: Integration (45 minutes)
+- [ ] Add `onCleanup` utility
+- [ ] Update existing effects to use Owner
+- [ ] Modify computation creation to register with owner
+- [ ] Test nested computations
+- [ ] Test cleanup order (children before parents)
+
+### Phase 5: Testing (1 hour)
+- [ ] Write unit tests for createRoot
+- [ ] Test ownership registration
+- [ ] Test cleanup cascade
+- [ ] Test memory leak prevention
+- [ ] Performance test with 1000s of nodes
+- [ ] Verify all existing tests still pass
 
 ## 🧪 Testing Ownership
 
@@ -668,10 +843,454 @@ test("re-running parent disposes old children", () => {
 });
 ```
 
+## ⏱️ When Cleanups Run: Complete Timeline
+
+Understanding WHEN cleanups execute is critical for avoiding bugs and memory leaks.
+
+### 1. Before Re-execution
+
+**Most Important:** Cleanups run BEFORE the effect/computation re-executes!
+
+```typescript
+const [count, setCount] = createSignal(0);
+
+createEffect(() => {
+  console.log(`Effect running with count=${count()}`);
+  
+  onCleanup(() => {
+    console.log(`Cleanup running for count=${count()}`);
+  });
+});
+
+// Output:
+// Effect running with count=0
+
+setCount(1);
+// Cleanup running for count=1 ← Runs BEFORE re-execution!
+// Effect running with count=1
+
+setCount(2);
+// Cleanup running for count=2
+// Effect running with count=2
+```
+
+**Why This Matters:**
+- Cleanup runs BEFORE new effect execution
+- Can access current values (not previous)
+- Perfect for canceling subscriptions/timers
+
+### 2. On Disposal
+
+Cleanups also run when the owner/computation is disposed:
+
+```typescript
+const dispose = createRoot(dispose => {
+  createEffect(() => {
+    console.log("Effect running");
+    
+    onCleanup(() => {
+      console.log("Cleanup on disposal");
+    });
+  });
+  
+  return dispose;
+});
+
+// Later:
+dispose();
+// Output: "Cleanup on disposal"
+```
+
+### 3. Order: Child to Parent (Reverse of Creation)
+
+When an owner has multiple owned computations, they clean up in reverse order:
+
+```typescript
+createEffect(() => {
+  console.log("Parent effect");
+  
+  onCleanup(() => console.log("Parent cleanup"));
+  
+  createEffect(() => {
+    console.log("Child effect 1");
+    onCleanup(() => console.log("Child 1 cleanup"));
+  });
+  
+  createEffect(() => {
+    console.log("Child effect 2");
+    onCleanup(() => console.log("Child 2 cleanup"));
+  });
+});
+
+// On re-execution or disposal:
+// Child 2 cleanup
+// Child 1 cleanup
+// Parent cleanup
+```
+
+**Rule:** Children clean up before parents (depth-first, reverse order)
+
+### 4. Common Use Cases
+
+#### Cleanup Timers
+
+```typescript
+createEffect(() => {
+  const timerId = setInterval(() => {
+    console.log("Tick");
+  }, 1000);
+  
+  onCleanup(() => {
+    console.log("Clearing interval");
+    clearInterval(timerId);
+  });
+});
+
+// On re-run or disposal: interval is cleared automatically!
+```
+
+#### Cleanup Event Listeners
+
+```typescript
+createEffect(() => {
+  const handler = () => console.log("Clicked");
+  
+  element.addEventListener("click", handler);
+  
+  onCleanup(() => {
+    element.removeEventListener("click", handler);
+  });
+});
+
+// Listener automatically removed on cleanup!
+```
+
+#### Cleanup Subscriptions
+
+```typescript
+createEffect(() => {
+  const subscription = observable.subscribe(value => {
+    console.log(value);
+  });
+  
+  onCleanup(() => {
+    subscription.unsubscribe();
+  });
+});
+
+// Subscription automatically cleaned up!
+```
+
+### 5. Cleanup Timeline Example
+
+```typescript
+const [show, setShow] = createSignal(true);
+
+createRoot(dispose => {
+  createEffect(() => {
+    console.log("Root effect START");
+    
+    onCleanup(() => console.log("Root cleanup"));
+    
+    if (show()) {
+      createEffect(() => {
+        console.log("Child effect START");
+        
+        onCleanup(() => console.log("Child cleanup"));
+      });
+    }
+  });
+  
+  return dispose;
+});
+
+// Output:
+// Root effect START
+// Child effect START
+
+setShow(false);
+// Child cleanup      ← Child cleaned first
+// Root cleanup       ← Then parent cleanup
+// Root effect START  ← Then re-execution
+
+dispose();
+// Root cleanup       ← Final cleanup on disposal
+```
+
+## 🎓 Deep Dive: Why Cleanup Order Matters
+
+### The JavaScript Event Loop Connection
+
+```typescript
+// Setup: Timer in effect
+createEffect(() => {
+  const id = setInterval(() => {
+    console.log("Tick");
+  }, 1000);
+  
+  onCleanup(() => clearInterval(id));
+});
+
+// When effect re-runs:
+// 1. cleanNode runs synchronously
+// 2. onCleanup callback executed
+// 3. clearInterval called
+// 4. Timer STOPPED
+// 5. Effect body executes
+// 6. NEW timer started
+
+// ✅ No overlap! Old timer stopped before new starts
+```
+
+### The DOM Listener Connection
+
+```typescript
+// Setup: Event listener in effect
+createEffect(() => {
+  const handler = (e) => console.log(signal());
+  
+  element.addEventListener('click', handler);
+  onCleanup(() => {
+    element.removeEventListener('click', handler);
+  });
+});
+
+// When effect re-runs:
+// 1. cleanNode runs
+// 2. Old handler removed
+// 3. Effect executes
+// 4. NEW handler added with current closure
+
+// ✅ No duplicate handlers!
+```
+
+## 🔍 Common Ownership Patterns
+
+### Pattern 1: Manual Disposal
+
+```typescript
+// Use case: Create/destroy reactive scope on demand
+const dispose = createRoot(dispose => {
+  // Set up reactive stuff
+  createEffect(() => { /* ... */ });
+  return dispose;
+});
+
+// Later: clean up everything
+dispose();
+```
+
+### Pattern 2: Component-Like Scope
+
+```typescript
+function createComponent(props) {
+  return createRoot(() => {
+    const [state, setState] = createSignal(props.initial);
+    
+    createEffect(() => {
+      console.log("State:", state());
+    });
+    
+    return {
+      get state() { return state(); },
+      setState
+    };
+  });
+}
+
+// No dispose needed - UNOWNED optimization!
+```
+
+### Pattern 3: Conditional Ownership
+
+```typescript
+createEffect(() => {
+  if (condition()) {
+    // These become owned by this effect
+    const memo = createMemo(() => expensive());
+    
+    createEffect(() => {
+      // This nested effect owned by parent
+      console.log(memo());
+    });
+  }
+  // When condition() changes, everything disposes!
+});
+```
+
+### Pattern 4: Detached Ownership
+
+```typescript
+// Create effect owned by different owner
+createRoot(dispose => {
+  const rootOwner = Owner;
+  
+  createEffect(() => {
+    // Create nested root detached from this effect
+    createRoot(() => {
+      // These won't dispose when parent effect re-runs!
+      createEffect(() => { /* ... */ });
+    }, rootOwner); // Owned by root instead
+  });
+  
+  return dispose;
+});
+```
+
+## 🐛 Debugging Ownership Issues
+
+### Debugging Tool 1: Ownership Inspector
+
+```typescript
+/**
+ * Prints the ownership tree
+ */
+function inspectOwnership(node: Owner, depth = 0): void {
+  const indent = '  '.repeat(depth);
+  const name = node.name || 'Anonymous';
+  const type = (node as Computation<any>).fn ? 'Computation' : 'Owner';
+  
+  console.log(`${indent}${type}: ${name}`);
+  
+  if (node.owned) {
+    node.owned.forEach(child => inspectOwnership(child, depth + 1));
+  }
+}
+
+// Usage:
+createRoot(dispose => {
+  inspectOwnership(Owner!);
+  return dispose;
+});
+```
+
+### Debugging Tool 2: Leak Detector
+
+```typescript
+/**
+ * Detects orphaned computations
+ */
+const allComputations = new WeakSet<Computation<any>>();
+
+function trackComputation(comp: Computation<any>): void {
+  allComputations.add(comp);
+}
+
+function checkLeaks(): void {
+  // Run GC if available
+  if (global.gc) global.gc();
+  
+  // Count surviving computations
+  // If number keeps growing → leak!
+}
+```
+
+### Debugging Tool 3: Cleanup Tracer
+
+```typescript
+/**
+ * Traces cleanup execution
+ */
+function onCleanupDebug(fn: () => void, label?: string): void {
+  onCleanup(() => {
+    console.log(`[Cleanup] ${label || 'Anonymous'}`);
+    fn();
+  });
+}
+
+// Usage:
+createEffect(() => {
+  onCleanupDebug(() => {
+    // cleanup
+  }, 'MyEffect');
+});
+```
+
+## 📊 Performance Optimization Tips
+
+### Tip 1: Reuse UNOWNED When Possible
+
+```typescript
+// ❌ Bad: Creates owner object unnecessarily
+createRoot(dispose => {
+  // Don't need dispose? Don't accept parameter!
+});
+
+// ✅ Good: Uses UNOWNED singleton
+createRoot(() => {
+  // No dispose parameter = UNOWNED optimization
+});
+```
+
+### Tip 2: Batch Cleanup
+
+```typescript
+// ❌ Bad: Many small cleanup calls
+createEffect(() => {
+  onCleanup(() => cleanup1());
+  onCleanup(() => cleanup2());
+  onCleanup(() => cleanup3());
+});
+
+// ✅ Good: Single cleanup batch
+createEffect(() => {
+  onCleanup(() => {
+    cleanup1();
+    cleanup2();
+    cleanup3();
+  });
+});
+```
+
+### Tip 3: Avoid Deep Ownership Trees
+
+```typescript
+// ❌ Bad: Deep nesting
+createEffect(() => {
+  createEffect(() => {
+    createEffect(() => {
+      createEffect(() => {
+        // 4 levels deep!
+      });
+    });
+  });
+});
+
+// ✅ Good: Flat structure
+createRoot(() => {
+  createEffect(() => { /* ... */ });
+  createEffect(() => { /* ... */ });
+  createEffect(() => { /* ... */ });
+});
+```
+
+## ✅ Self-Check Questions
+
+1. **Q:** When do cleanups run?
+   **A:** Before re-execution and on disposal, in reverse order (children first).
+
+2. **Q:** What's the UNOWNED optimization?
+   **A:** Reusing a singleton Owner for roots without dispose functions saves memory.
+
+3. **Q:** How does ownership prevent memory leaks?
+   **A:** Parents automatically dispose children when re-running or disposing.
+
+4. **Q:** What's the difference between Owner and Listener?
+   **A:** Owner can create children, Listener subscribes to signals (both can be same).
+
+5. **Q:** Why clean up in reverse order?
+   **A:** Children may depend on parents; clean children first to avoid errors.
+
+6. **Q:** When should you use `createRoot`?
+   **A:** To create an isolated scope with manual cleanup control.
+
+7. **Q:** What happens if you create an effect outside any root?
+   **A:** Warning logged, effect will never dispose (potential leak).
+
 ## 🚀 Next Step
 
 Continue to **[04-bidirectional-tracking.md](./04-bidirectional-tracking.md)** to implement O(1) dependency management.
 
 ---
 
-**💡 Pro Tip**: Ownership is the foundation of memory safety. Get this right and you'll never worry about leaks again!
+**💡 Pro Tip**: Ownership is the foundation of memory safety. Get this right and you'll never worry about leaks again! If you're unsure, add more `onCleanup` calls—cleanup is cheap, memory leaks are expensive. Always test with `createRoot` and verify disposal works correctly.

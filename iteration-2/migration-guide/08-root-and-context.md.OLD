@@ -85,42 +85,21 @@ export function createRoot<T>(
 }
 ```
 
-### Step 2: Complete Context API Implementation
+### Step 2: Context API
 
-#### Context Type Definition
+#### Create Context
 
 ```typescript
-/**
- * Context object returned by createContext
- * Contains id for lookup and Provider component
- */
 export interface Context<T> {
-  id: symbol;                    // Unique identifier for lookups
-  Provider: Component<ProviderProps<T>>;  // Provider component
-  defaultValue: T;               // Fallback value
+  id: symbol;
+  Provider: ContextProviderComponent<T>;
+  defaultValue: T;
 }
 
-interface ProviderProps<T> {
-  value: T;
-  children?: JSX.Element;
-}
-```
-
-#### createContext() - Full Implementation
-
-```typescript
-/**
- * Creates a new context with optional default value
- * 
- * @param defaultValue - Value to use when no provider is found
- * @param options - Optional name for debugging
- * @returns Context object with id, Provider, and defaultValue
- */
 export function createContext<T>(
   defaultValue?: T,
   options?: { name?: string }
 ): Context<T | undefined> {
-  // Create unique symbol for this context
   const id = Symbol(options?.name || "context");
   
   return {
@@ -131,365 +110,83 @@ export function createContext<T>(
 }
 ```
 
-#### createProvider() - The Magic Behind Providers
+#### Create Provider
 
 ```typescript
-/**
- * Creates a Provider component for a context
- * This is called internally by createContext
- * 
- * @param id - Context symbol identifier  
- * @param options - Optional configuration
- * @returns Provider component function
- */
-function createProvider<T>(
-  id: symbol,
-  options?: EffectOptions
-) {
-  return function Provider(props: ProviderProps<T>): Accessor<JSX.Element> {
-    let res: Accessor<JSX.Element>;
+function createProvider(id: symbol, options?: { name?: string }) {
+  return function Provider(props: { value: any; children: any }) {
+    let res;
     
-    // Use render effect to set up context
     createRenderEffect(() => {
-      // Run without tracking to avoid dependencies
       res = untrack(() => {
-        // Set context on current Owner
-        // This makes the value available to all descendants
+        // Set context on current owner
         Owner!.context = {
-          // Spread existing context (inherit parent contexts)
           ...Owner!.context,
-          // Add/override this context value
           [id]: props.value
         };
         
-        // Resolve children with context available
+        // Resolve children
         return children(() => props.children);
       });
     }, undefined, options);
     
-    return res as Accessor<JSX.Element>;
+    return res;
   };
 }
 ```
 
-#### useContext() - Looking Up Context Values
+#### Use Context
 
 ```typescript
-/**
- * Looks up a context value from the owner tree
- * 
- * @param context - Context object from createContext
- * @returns Current context value or default
- * 
- * Algorithm:
- * 1. Start with current Owner
- * 2. Check if Owner has context[id]
- * 3. If not, walk up owner chain
- * 4. Return first found value or default
- */
 export function useContext<T>(context: Context<T>): T {
   let value: T | undefined;
   
-  // Look up in current Owner's context
-  return (
-    Owner &&
-    Owner.context &&
-    (value = Owner.context[context.id]) !== undefined
-  )
+  // Look up context in current owner
+  return Owner && Owner.context && (value = Owner.context[context.id]) !== undefined
     ? value
     : context.defaultValue;
 }
 ```
 
-#### mutateContext() - Propagating Context Updates
+### Step 3: Children Helper
 
 ```typescript
-/**
- * Mutates context down the ownership tree
- * Called when Provider value changes
- * 
- * @param owner - Root owner to start from
- * @param key - Context symbol to update
- * @param value - New value
- */
-function mutateContext(owner: Owner, key: symbol, value: any): void {
-  if (owner.owned) {
-    for (let i = 0; i < owner.owned.length; i++) {
-      const child = owner.owned[i];
-      
-      // If child shares parent's context object, recurse
-      if (child.context === owner.context) {
-        mutateContext(child, key, value);
-      }
-      // If child has no context, set it
-      else if (!child.context) {
-        child.context = owner.context;
-        mutateContext(child, key, value);
-      }
-      // If child has context but not this key, add it
-      else if (!(key in child.context)) {
-        child.context[key] = value;
-        mutateContext(child, key, value);
-      }
-    }
-  }
-}
-```
-
-### Step 3: Advanced Utilities
-
-#### getOwner() and runWithOwner()
-
-```typescript
-/**
- * Gets the current reactive owner
- * Useful for capturing context to run later
- */
-export function getOwner(): Owner | null {
-  return Owner;
-}
-
-/**
- * Runs a function with a specific owner
- * Allows running code in a different reactive scope
- * 
- * @param owner - Owner to use as context
- * @param fn - Function to run
- * @returns Result of fn()
- */
-export function runWithOwner<T>(owner: Owner, fn: () => T): T | undefined {
-  if (!owner) return undefined;
-  
-  const prevOwner = Owner;
-  const prevListener = Listener;
-  
-  Owner = owner;
-  Listener = null;
-  
-  try {
-    return fn();
-  } finally {
-    Owner = prevOwner;
-    Listener = prevListener;
-  }
-}
-```
-
-#### getListener() - For Advanced Cases
-
-```typescript
-/**
- * Gets the current reactive listener (computation)
- * Useful for advanced reactive patterns
- */
-export function getListener(): Computation<any> | null {
-  return Listener;
-}
-```
-
-### Step 4: Children Helper
-
-```typescript
-/**
- * Types for children resolution
- */
 export type ResolvedChildren = JSX.Element | JSX.Element[];
-
 export type ChildrenReturn = Accessor<ResolvedChildren> & {
-  toArray: () => JSX.Element[];
+  toArray: () => JSX.Element[]
 };
 
-/**
- * Resolves and memoizes children
- * Handles functions, arrays, and normalizes the result
- * 
- * @param fn - Accessor that returns children
- * @returns Memoized children accessor with toArray method
- */
 export function children(fn: Accessor<JSX.Element>): ChildrenReturn {
-  // Create memo for children
-  const childrenMemo = createMemo(fn);
+  const children = createMemo(fn);
+  const memo = createMemo(() => resolveChildren(children()));
   
-  // Create memo for resolved children
-  const resolved = createMemo(() => resolveChildren(childrenMemo()));
-  
-  // Add toArray helper
-  (resolved as ChildrenReturn).toArray = () => {
-    const c = resolved();
+  (memo as ChildrenReturn).toArray = () => {
+    const c = memo();
     return Array.isArray(c) ? c : c != null ? [c] : [];
   };
   
-  return resolved as ChildrenReturn;
+  return memo as ChildrenReturn;
 }
 
-/**
- * Recursively resolves children
- * Unwraps functions and flattens arrays
- * 
- * @param children - Raw children value
- * @returns Resolved children
- */
 function resolveChildren(children: any): ResolvedChildren {
-  // If function with no params, call it and recurse
   if (typeof children === "function" && !children.length) {
     return resolveChildren(children());
   }
   
-  // If array, recursively resolve each child
   if (Array.isArray(children)) {
     const results: any[] = [];
-    
     for (let i = 0; i < children.length; i++) {
       const result = resolveChildren(children[i]);
-      
-      // Flatten arrays
-      if (Array.isArray(result)) {
-        results.push.apply(results, result);
-      } else {
-        results.push(result);
-      }
+      Array.isArray(result)
+        ? results.push.apply(results, result)
+        : results.push(result);
     }
-    
     return results;
   }
   
-  // Return as-is
   return children;
 }
 ```
-
----
-
-## 🎨 Complete Usage Examples
-
-### Example 1: Basic Root with Disposal
-
-```typescript
-// Create an isolated reactive scope
-const dispose = createRoot(dispose => {
-  const [count, setCount] = createSignal(0);
-  
-  // Set up interval
-  const interval = setInterval(() => {
-    setCount(c => c + 1);
-    console.log("Count:", count());
-  }, 1000);
-  
-  // Register cleanup
-  onCleanup(() => {
-    clearInterval(interval);
-    console.log("Root disposed - interval cleared");
-  });
-  
-  // Return the dispose function
-  return dispose;
-});
-
-// Let it run for 5 seconds
-setTimeout(() => {
-  dispose(); 
-  // Logs: "Root disposed - interval cleared"
-  // No more intervals fire!
-}, 5000);
-```
-
-### Example 2: Nested Roots with Hierarchy
-
-```typescript
-const outerDispose = createRoot(dispose => {
-  console.log("Outer root created");
-  
-  const [outerSignal, setOuterSignal] = createSignal("outer");
-  
-  // Inner root owned by outer
-  const innerDispose = createRoot(dispose => {
-    console.log("Inner root created");
-    console.log("Inner can access outer:", outerSignal());
-    
-    createEffect(() => {
-      console.log("Inner effect:", outerSignal());
-    });
-    
-    return dispose;
-  });
-  
-  // Outer effect
-  createEffect(() => {
-    console.log("Outer effect:", outerSignal());
-  });
-  
-  // Composite disposal
-  return () => {
-    console.log("Disposing inner first...");
-    innerDispose();
-    console.log("Then disposing outer...");
-    dispose();
-  };
-});
-
-// Later: clean up everything
-outerDispose();
-/* Output:
-Disposing inner first...
-Inner effect disposed
-Then disposing outer...
-Outer effect disposed
-*/
-```
-
-### Example 3: Theme Context
-
-```typescript
-// Define theme context with default
-const ThemeContext = createContext<{ theme: string; toggleTheme: () => void }>({
-  theme: "light",
-  toggleTheme: () => {}
-});
-
-// Root component
-function App() {
-  const [theme, setTheme] = createSignal<"light" | "dark">("light");
-  
-  const toggleTheme = () => {
-    setTheme(t => t === "light" ? "dark" : "light");
-  };
-  
-  // Provide theme context
-  return (
-    <ThemeContext.Provider value={{ theme: theme(), toggleTheme }}>
-      <Toolbar />
-      <MainContent />
-    </ThemeContext.Provider>
-  );
-}
-
-// Child component
-function Toolbar() {
-  const { theme, toggleTheme } = useContext(ThemeContext);
-  
-  return (
-    <div style={{ background: theme === "dark" ? "#333" : "#fff" }}>
-      <button onClick={toggleTheme}>
-        Switch to {theme === "dark" ? "light" : "dark"}
-      </button>
-    </div>
-  );
-}
-
-// Another child
-function MainContent() {
-  const { theme } = useContext(ThemeContext);
-  
-  createEffect(() => {
-    console.log("Current theme:", theme);
-    document.body.className = theme;
-  });
-  
-  return <div>Content styled with {theme} theme</div>;
-}
-```
-
-### Example 4: Nested Providers (Override)
 
 ## 🎨 Usage Examples
 

@@ -537,59 +537,102 @@ export function writeSignal<T>(node: SignalState<T>, value: T) {
             else Effects!.push(obs);
           }
         }
-      }, true);  // ← init=true means flush effects immediately
+      }, false);  // ← init=false (explained below)
     }
   }
   return node.value;
 }
 ```
 
-### The Execution Flow
+### ⚠️ CRITICAL: Understanding Batching in SolidJS
 
-```
-User Code:                   runUpdates:                    Results:
-─────────────────────────────────────────────────────────────────────
-setA(5);                →    Updates = []                   
-                             Effects = []
-                             ExecCount++
-                             
-                        →    fn() executes:
-                             - mark sum as STALE
-                             - add sum to Updates
-                             - mark effect as STALE  
-                             - add effect to Effects
-                             
-                        →    Flush Updates:
-                             - run sum()
-                             - sum.state = CLEAN
-                             
-                        →    Flush Effects:
-                             - run effect()
-                             - effect.state = CLEAN
-                             
-                        →    Updates = null         →    Done! ✅
-                             Effects = null
-```
+**Common Misconception:** "`init=false` enables automatic batching"
 
-### Why This Matters
+**Reality:** Effects flush SYNCHRONOUSLY after each signal update!
 
-**Without runUpdates implemented:**
-```javascript
-setA(5);  // Marks STALE but never flushes!
-setB(10); // Marks STALE but never flushes!
-// Effects sit in queue forever, never execute! ❌
+```typescript
+// WITHOUT batch() - Effects run multiple times:
+setA(5);
+// ↓ Synchronous execution:
+// - Mark observers STALE
+// - Flush Updates (memos)
+// - Flush Effects ✅ (Effect runs!)
+// - Effects = null (cleared!)
+// - RETURN
+
+setB(10);
+// ↓ Synchronous execution AGAIN:
+// - Mark observers STALE
+// - Flush Updates (memos)
+// - Flush Effects ✅ (Effect runs AGAIN!)
+// - Effects = null (cleared!)
+// - RETURN
+
+// Result: Effect ran TWICE! (Potential glitch!)
 ```
 
-**With runUpdates:**
-```javascript
-setA(5);  // Marks STALE → flushes Updates → flushes Effects ✅
-setB(10); // Marks STALE → flushes Updates → flushes Effects ✅
-// Everything executes properly! 🎉
+### To Actually Batch Updates:
+
+```typescript
+// Use batch() explicitly:
+batch(() => {
+  setA(5);
+  setB(10);
+});
+// Effect runs ONCE! ✅
+```
+
+Inside `batch()`:
+- First `writeSignal`: Creates Updates/Effects queues
+- Second `writeSignal`: `if (Updates) return fn();` (just marks, no flush!)
+- After batch: Flush happens ONCE with all changes
+
+### The Real Execution Flow
+
+```
+WITHOUT batch():
+─────────────────────────────────────────────────────────
+setA(5);                →    runUpdates creates queues
+                        →    Mark observers
+                        →    Flush Updates
+                        →    Flush Effects (effect runs!)
+                        →    Clear: Effects = null
+                        →    RETURN
+
+setB(10);               →    runUpdates creates NEW queues
+                        →    Mark observers
+                        →    Flush Updates
+                        →    Flush Effects (effect runs again!)
+                        →    Clear: Effects = null
+                        →    RETURN
+
+Result: Effect ran TWICE! ⚠️
+```
+
+```
+WITH batch():
+─────────────────────────────────────────────────────────
+batch(() => {
+  setA(5);              →    if (Updates) return fn()
+                        →    Just marks, no flush!
+  
+  setB(10);             →    if (Updates) return fn()
+                        →    Just marks, no flush!
+});
+                        →    NOW flush happens ONCE
+                        →    Effect runs with final values
+                        →    RETURN
+
+Result: Effect ran ONCE! ✅
 ```
 
 ## 🚀 Next Step
 
-Continue to **[05-computation-states.md](./05-computation-states.md)** to implement the state machine for lazy evaluation.
+**MUST READ:** 
+- **[04.5-the-truth-about-batching.md](./04.5-the-truth-about-batching.md)** - Learn when you need `batch()`
+- **[04.6-synchronous-execution-model.md](./04.6-synchronous-execution-model.md)** - Understand timing
+
+Then continue to **[05-computation-states.md](./05-computation-states.md)** to implement the state machine for lazy evaluation.
 
 ---
 

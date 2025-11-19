@@ -1,369 +1,89 @@
 # Step 7: Production-Ready Memo Implementation
 
 ## 🎯 Goal
-Implement memos as first-class computations that can have observers, enabling efficient derived value chains with proper integration into the Updates queue.
+Implement memos as first-class computations that can have observers, enabling efficient derived value chains.
 
-## 🚨 Prerequisites
+## 🤔 The Difference
 
-This lesson builds directly on:
-- **Lesson 6**: Scheduling (Updates queue, runUpdates, completeUpdates)
-- **Lesson 3**: Ownership (cleanNode, Owner context)
-- **Lesson 5**: States (STALE, PENDING, Clean)
-
-**You must understand these first** or nothing here will make sense!
-
----
-
-## 🤔 The Problem: Your Current Implementation
-
-### What You Probably Have
-
+### Your Current Implementation
 ```javascript
-function createMemo(fn, options) {
-  // Two separate primitives!
-  const [signal, setSignal] = createSignal(undefined, options);
+function createMemo(fn, opts) {
+  const [signal, setSignal] = createSignal(undefined, opts);
   
   createEffect(() => {
     const value = fn();
-    setSignal(value);  // Signal update triggers observers
+    setSignal(value);
   });
   
-  return signal;  // Return just the getter
+  return signal;
 }
 ```
 
-### The Problems
+**Problems:**
+- Wrapper overhead (signal + effect)
+- Memo can't have observers directly
+- Extra layer of indirection
+- Less efficient
 
-1. **❌ Wrapper Overhead**
-   - Every memo is TWO reactive primitives (signal + effect)
-   - Double the memory
-   - Double the tracking overhead
-   - Extra indirection layer
+### Solid.js Approach
+```typescript
+// Memo IS a Computation AND a SignalState
+interface Memo<T> extends SignalState<T>, Computation<T> {
+  value: T; // Required (not optional)
+  observers: Computation[] | null; // Can have observers!
+  pure: true; // Always pure
+}
+```
 
-2. **❌ Can't Have Direct Observers**
-   - Memo is not a signal, can't be observed
-   - Must wrap in another signal
-   - Breaks the reactive graph efficiency
+## 🏗️ Implementation
 
-3. **❌ Wrong Queue**
-   - Effect runs in Effects queue
-   - Memos should run in Updates queue
-   - Order not guaranteed
-
-4. **❌ Always Eager**
-   - Effect always runs on dependency change
-   - No lazy evaluation
-   - Can't skip unused memos
-
----
-
-## 📊 Solid.js Approach: First-Class Memos
-
-### The Unified Type
+### Step 1: Memo Type (Already Done in Step 2)
 
 ```typescript
-/**
- * Memo IS BOTH a SignalState AND a Computation
- * This dual nature enables efficient observation and computation
- */
-interface Memo<Prev, Next = Prev> 
+export interface Memo<Prev, Next = Prev> 
   extends SignalState<Next>, Computation<Next> {
-  
-  // From SignalState (can be observed)
-  value: Next;                        // Required! (not optional like Computation)
-  observers: Computation<any>[] | null;
-  observerSlots: number[] | null;
-  comparator?: (prev: Next, next: Next) => boolean;
-  
-  // From Computation (can compute)
-  fn: EffectFunction<Prev, Next>;
-  state: ComputationState;
-  sources: SignalState<any>[] | null;
-  sourceSlots: number[] | null;
-  pure: true;                         // ALWAYS true for memos!
-  
-  // Transition support (Lesson 9)
-  tValue?: Next;
-  tOwned?: Computation<any>[];
+  value: Next;
+  tOwned?: Computation<Prev | Next, Next>[]; // For transitions
 }
-
 ```
 
-### Why This Matters
+### Step 2: Create Memo Function
 
 ```typescript
-// Without first-class memos:
-Signal + Effect = 2 nodes
-Memory: ~200 bytes
-
-// With first-class memos:
-Memo = 1 node
-Memory: ~120 bytes
-
-Savings: 40% less memory, 50% less tracking overhead
-```
-
----
-
-## 🏗️ Complete Implementation
-
-### Part 1: Creating the Memo
-
-```typescript
-/**
- * Creates a memoized computation that caches its result
- * 
- * Overloads:
- * 1. No initial value - computed on first access
- * 2. With initial value - used until computed
- * 3. With options - custom comparator, name, etc.
- */
 export function createMemo<Next extends Prev, Prev = Next>(
   fn: EffectFunction<undefined | NoInfer<Prev>, Next>
 ): Accessor<Next>;
-
 export function createMemo<Next extends Prev, Init = Next, Prev = Next>(
   fn: EffectFunction<Init | Prev, Next>,
   value: Init,
   options?: MemoOptions<Next>
 ): Accessor<Next>;
-
 export function createMemo<Next extends Prev, Init, Prev>(
   fn: EffectFunction<Init | Prev, Next>,
   value?: Init,
   options?: MemoOptions<Next>
 ): Accessor<Next> {
-  // Merge options with defaults
-  const opts = options 
-    ? Object.assign({}, signalOptions, options) 
-    : signalOptions;
+  options = options ? Object.assign({}, signalOptions, options) : signalOptions;
 
-  // CRITICAL: Create as computation with pure=true
-  // This routes it to the Updates queue!
+  // Create as computation
   const c: Partial<Memo<Init, Next>> = createComputation(
     fn,
     value!,
-    true,  // pure = true → Updates queue
-    0,     // Start CLEAN (will compute on first access)
-    opts
+    true, // pure = true
+    0,    // Start clean (will update immediately)
+    options
   ) as Partial<Memo<Init, Next>>;
 
-  // Add SignalState properties for observation
+  // Add signal properties
   c.observers = null;
   c.observerSlots = null;
-  c.comparator = opts.equals || undefined;
-  
-  // Transition support (Lesson 9)
-  if (Transition && Transition.running && Transition.sources.has(c as any)) {
-    c.tValue = value;
-  }
+  c.comparator = options.equals || undefined;
   
   // Initial computation
-  // This runs the function once to get initial value
   updateComputation(c as Memo<Init, Next>);
   
   // Return bound read function
-  // When called, this will check state and recompute if needed
-  return readSignal.bind(null, c as Memo<Init, Next>) as Accessor<Next>;
-}
-```
-
-### Part 2: Reading Memos (Enhanced readSignal)
-
-```typescript
-/**
- * Reads a signal or memo value, tracking dependency if Listener is set
- * For memos, checks state and recomputes if needed
- * 
- * @param node - SignalState or Memo to read
- * @returns Current value
- */
-export function readSignal<T>(
-  this: SignalState<T> | Memo<T> | null,
-  node?: SignalState<T> | Memo<T>
-): T {
-  const target = node || this;
-  if (!target) throw new Error("Invalid signal");
-  
-  // CRITICAL: Check if this is a memo that needs updating
-  if ((target as Memo<T>).sources && (target as Memo<T>).state) {
-    const memo = target as Memo<T>;
-    const runningTransition = Transition && Transition.running;
-    
-    // Check state (or tState in transition)
-    const state = runningTransition ? memo.tState : memo.state;
-    
-    if (state === STALE) {
-      // Fully STALE - needs recomputation
-      updateComputation(memo);
-    } else if (state === PENDING) {
-      // PENDING - upstream might be stale
-      // Check upstream dependencies first
-      const updates = Updates;
-      Updates = null;
-      
-      // This will recursively update upstream memos
-      runUpdates(() => lookUpstream(memo), false);
-      
-      Updates = updates;
-    }
-  }
-  
-  // Track dependency if we're in a computation
-  if (Listener) {
-    // Get slot in observer's array
-    const sSlot = target.observers ? target.observers.length : 0;
-    
-    // Add to listener's sources
-    if (!Listener.sources) {
-      Listener.sources = [target];
-      Listener.sourceSlots = [sSlot];
-    } else {
-      Listener.sources.push(target);
-      Listener.sourceSlots!.push(sSlot);
-    }
-    
-    // Add listener to our observers
-    if (!target.observers) {
-      target.observers = [Listener];
-      target.observerSlots = [Listener.sources.length - 1];
-    } else {
-      target.observers.push(Listener);
-      target.observerSlots!.push(Listener.sources.length - 1);
-    }
-  }
-  
-  // Return transition value if in transition, else normal value
-  if (Transition && Transition.running && Transition.sources.has(target)) {
-    return target.tValue!;
-  }
-  
-  return target.value;
-}
-```
-
-### Part 3: Writing Memo Values (in runComputation)
-
-```typescript
-/**
- * Runs a computation's function and handles the result
- * For memos, this writes the new value as a signal
- */
-function runComputation<T>(
-  node: Computation<T>,
-  value: T,
-  time: number
-): void {
-  let nextValue;
-  
-  const owner = Owner;
-  const listener = Listener;
-  
-  // Set computation as current context
-  Listener = Owner = node;
-  
-  try {
-    // Run the function
-    nextValue = node.fn(value);
-  } catch (err) {
-    // Error in pure computation (memo)
-    if (node.pure) {
-      // Mark STALE, dispose owned, but don't stop
-      node.state = STALE;
-      node.owned && node.owned.forEach(cleanNode);
-      node.owned = null;
-    }
-    
-    node.updatedAt = time + 1;
-    return handleError(err);
-  } finally {
-    // Always restore context
-    Listener = listener;
-    Owner = owner;
-  }
-  
-  // Update value if needed
-  if (!node.updatedAt || node.updatedAt <= time) {
-    // CRITICAL: For memos with observers, write as signal
-    // This triggers downstream computations
-    if (node.updatedAt != null && "observers" in node) {
-      writeSignal(node as Memo<T>, nextValue, true);
-    } else {
-      // Regular computation, just store value
-      node.value = nextValue;
-    }
-    
-    node.updatedAt = time;
-  }
-}
-```
-
-### Part 4: Memo-Specific writeSignal
-
-```typescript
-/**
- * Enhanced writeSignal that handles memos
- * 
- * @param node - Signal or Memo to write
- * @param value - New value
- * @param isComp - Is this from a computation? (skips comparator)
- */
-export function writeSignal<T>(
-  node: SignalState<T> | Memo<T>,
-  value: T,
-  isComp?: boolean
-): T {
-  const runningTransition = Transition && Transition.running;
-  
-  // In transition, update tValue
-  if (runningTransition && Transition.sources.has(node)) {
-    node.tValue = value;
-  }
-  
-  // Check if value changed (skip comparator for computations)
-  if (isComp || !node.comparator || !node.comparator(node.value, value)) {
-    // Handle transition state
-    if (runningTransition) {
-      if (!node.tValue) node.tValue = node.value;
-      node.value = value;
-    } else {
-      node.value = value;
-    }
-    
-    // Notify observers
-    if (node.observers && node.observers.length) {
-      runUpdates(() => {
-        for (let i = 0; i < node.observers!.length; i++) {
-          const o = node.observers![i];
-          const TransitionRunning = runningTransition && Transition.running;
-          
-          // Skip if already marked
-          if (TransitionRunning ? !o.tState : !o.state) {
-            // Mark as STALE
-            if (TransitionRunning) {
-              o.tState = STALE;
-            } else {
-              o.state = STALE;
-            }
-            
-            // Route to appropriate queue
-            if (o.pure) {
-              Updates!.push(o);  // Memo → Updates
-            } else {
-              Effects!.push(o);  // Effect → Effects
-            }
-            
-            // If observer is also a memo, mark downstream as PENDING
-            if ((o as Memo<any>).observers) {
-              markDownstream(o as Memo<any>);
-            }
-          }
-        }
-      }, false);
-    }
-  }
-  
-  return value;
+  return readSignal.bind(c as Memo<Init, Next>);
 }
 ```
 
